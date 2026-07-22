@@ -45,6 +45,7 @@ def _cache_put(cache, key, val, cap=2):
 def clear_caches():
     _bake_cache.clear()
     _island_cache.clear()
+    _simple_cache.clear()
 
 
 # ---------------------------------------------------------------------------
@@ -392,6 +393,55 @@ def _bake_triple(context, obj, source, image, bake_size, loop_uv):
     return triple
 
 
+_simple_cache = {}
+
+
+def _eval_simple_coords(context, obj, level):
+    """在网格副本上做同级 SIMPLE 多级细分求值 → 顶点坐标 (V,3)。按指纹缓存。
+
+    Catmull-Clark(平滑)细分会把开放边界向内收缩——锁位移锁不住细分自身的漂移。
+    SIMPLE 细分与 CC 细分的拓扑/顶点序完全一致(同一均匀细化, 模式只影响坐标),
+    其边界顶点恰好留在基面边缘原位, 用作边界校正的目标位置。
+    副本不带任何其它修改器(与主求值隐藏 Armature 的口径一致)。
+    """
+    me = obj.data
+    key = (me.name_full, len(me.vertices), len(me.loops), int(level), 'simple')
+    got = _simple_cache.get(key)
+    if got is not None:
+        return got
+
+    tmp_o = None
+    me2 = None
+    try:
+        me2 = me.copy()
+        tmp_o = bpy.data.objects.new("NMTM_simple_tmp", me2)
+        context.scene.collection.objects.link(tmp_o)
+        for o in list(context.selected_objects):
+            o.select_set(False)
+        tmp_o.select_set(True)
+        context.view_layer.objects.active = tmp_o
+        mod = tmp_o.modifiers.new("NMTM_simple", 'MULTIRES')
+        for _ in range(level):
+            bpy.ops.object.multires_subdivide(modifier=mod.name, mode='SIMPLE')
+        mod.levels = level
+        dg = context.evaluated_depsgraph_get()
+        ev_me = tmp_o.evaluated_get(dg).data
+        n = len(ev_me.vertices)
+        buf = np.empty(n * 3, np.float32)
+        ev_me.vertices.foreach_get("co", buf)
+        coords = buf.reshape(-1, 3).copy()
+    finally:
+        if tmp_o is not None:
+            bpy.data.objects.remove(tmp_o, do_unlink=True)
+        if me2 is not None:
+            try:
+                bpy.data.meshes.remove(me2)
+            except Exception:
+                pass
+    _cache_put(_simple_cache, key, coords)
+    return coords
+
+
 def _get_island_labels(me, loop_vert, loop_uv, loop_total):
     """基面 → UV 岛标签(按网格内容指纹缓存)。"""
     fp = hash(loop_uv[:: max(1, loop_uv.shape[0] // 4096)].tobytes())
@@ -533,13 +583,69 @@ def build(context, obj, s, report):
         ln = np.linalg.norm(n0_vert, axis=1)
         n0_vert /= np.maximum(ln, 1e-6)[:, None]
         amp_vert = h_vert * np.float32(s.disp_scale) * (ln > 0.1).astype(np.float32)
+        dvec = n0_vert * amp_vert[:, None]
+
+        # 边缘锁定 + 位移场平滑(等价: 多级精度平滑后沿边缘刷"擦除多级精度置换"):
+        # 开放边界顶点(卡片边缘)位移严格归零——边缘偏移会把原本贴合的卡片边
+        # 撕出缝隙, 基面边缘本来就是对的; 再对位移向量场做图拉普拉斯平滑
+        # (边界 Dirichlet 0), 位移向边缘平滑衰减, 同时去除高频斑点。
+        ecount = len(tmp_me.edges)
+        ev = np.empty(ecount * 2, np.int32)
+        tmp_me.edges.foreach_get("vertices", ev)
+        ev = ev.reshape(-1, 2)
+        le = np.empty(len(tmp_me.loops), np.int32)
+        tmp_me.loops.foreach_get("edge_index", le)
+        edge_face_count = np.bincount(le, minlength=ecount)
+        boundary_verts = np.unique(ev[edge_face_count[:ecount] == 1].ravel())
+        e0 = ev[:, 0].astype(np.int64)
+        e1 = ev[:, 1].astype(np.int64)
+        if boundary_verts.size:
+            dvec[boundary_verts] = 0.0
+        iters = int(s.edge_smooth_iters)
+        if iters > 0 and ecount:
+            deg = (np.bincount(e0, minlength=vcount)
+                   + np.bincount(e1, minlength=vcount)).astype(np.float64)
+            deg = np.maximum(deg, 1.0)
+            for _ in range(iters):
+                nb = np.empty_like(dvec)
+                for c in range(3):
+                    sc = (np.bincount(e0, weights=dvec[e1, c], minlength=vcount)
+                          + np.bincount(e1, weights=dvec[e0, c], minlength=vcount))
+                    nb[:, c] = (sc / deg).astype(np.float32)
+                dvec = 0.5 * dvec + 0.5 * nb
+                if boundary_verts.size:
+                    dvec[boundary_verts] = 0.0
 
         co = _read_vert_cos(tmp_me)
-        co += n0_vert * amp_vert[:, None]
+
+        # Catmull-Clark(平滑)细分的边界校正: CC 把开放边界向内收缩, 锁位移锁不住
+        # 细分自身的漂移——用同拓扑 SIMPLE 对照细分把边界顶点拉回基面边缘原位,
+        # 校正量沿图距离在 K 环内线性衰减, 平滑融入 CC 内部
+        corr_stat = ""
+        if s.subdiv_mode == 'CATMULL_CLARK' and boundary_verts.size and ecount:
+            coords_simple = _eval_simple_coords(context, obj, level)
+            if coords_simple.shape[0] != vcount:
+                print(f"[NormalMapToMesh] 警告: SIMPLE 对照细分拓扑不匹配"
+                      f"({coords_simple.shape[0]:,} vs {vcount:,}), 跳过边界校正")
+            else:
+                k_rings = max(2, 2 ** (level - 1))
+                dist = np.full(vcount, k_rings + 1, np.int32)
+                dist[boundary_verts] = 0
+                for _ in range(k_rings):
+                    np.minimum.at(dist, e1, dist[e0] + 1)
+                    np.minimum.at(dist, e0, dist[e1] + 1)
+                wgt = np.clip(1.0 - dist.astype(np.float32) / k_rings, 0.0, 1.0)
+                corr = (coords_simple - co) * wgt[:, None]
+                co += corr
+                corr_stat = (f" | CC边界校正 max "
+                             f"{np.linalg.norm(corr, axis=1).max() * 1000:.2f}‰/{k_rings}环")
+
+        co += dvec
         tmp_me.vertices.foreach_set("co", co.ravel())
         tmp_me.update()
-        mag = np.abs(amp_vert)
-        disp_stat = (f"{n_islands} 岛 | 位移幅值 p50 {np.percentile(mag, 50) * 1000:.2f} / "
+        mag = np.linalg.norm(dvec, axis=1)
+        disp_stat = (f"{n_islands} 岛 | 边界锁定 {boundary_verts.size:,} 顶点{corr_stat} | "
+                     f"位移幅值 p50 {np.percentile(mag, 50) * 1000:.2f} / "
                      f"p95 {np.percentile(mag, 95) * 1000:.2f} / "
                      f"max {mag.max() * 1000:.2f} (千分之一物体单位)")
         t_displace = time.perf_counter()

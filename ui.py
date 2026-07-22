@@ -31,10 +31,17 @@ class NMTMSettings(bpy.types.PropertyGroup):
                ('2048', "2048", ""), ('4096', "4096", "")),
         default='2048',
         description="物体空间法线烘焙图分辨率, 通常取源法线贴图同档")
+    edge_smooth_iters: IntProperty(
+        name="边缘/位移平滑", default=8, min=0, max=64,
+        description="位移向量场的图拉普拉斯平滑迭代次数: 开放边界(卡片边缘)顶点"
+                    "始终锁死为零位移(防边缘错位撕缝), 平滑让位移向边缘平滑衰减"
+                    "并去除高频斑点; 0=只锁边不平滑")
     subdiv_mode: EnumProperty(
         name="细分方式",
-        items=(('SIMPLE', "Simple (保形)", "保持低模形状, 细节与烘焙面完全对位(推荐)"),
-               ('CATMULL_CLARK', "Catmull-Clark", "平滑基面(基面会轻微收缩, 与烘焙面略有偏差)"),
+        items=(('SIMPLE', "Simple (保形)", "保持低模形状, 细节与烘焙面完全对位"),
+               ('CATMULL_CLARK', "平滑 (Catmull-Clark)",
+                "平滑基面; 开放边界的收缩漂移会用 SIMPLE 对照细分自动校正回基面边缘"
+                "(边缘钉死不产生缝隙), 首次构建多一次对照细分开销"),
                ('LINEAR', "Linear", "线性细分")),
         default='SIMPLE')
     auto_levels: BoolProperty(
@@ -75,6 +82,7 @@ class NMTM_PT_panel(bpy.types.Panel):
         box = layout.box()
         box.label(text="选项", icon='PREFERENCES')
         box.prop(s, "bake_size", text="烘焙")
+        box.prop(s, "edge_smooth_iters")
         box.prop(s, "subdiv_mode", text="细分")
         row = box.row()
         row.prop(s, "auto_levels")
