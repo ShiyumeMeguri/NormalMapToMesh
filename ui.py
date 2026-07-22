@@ -20,10 +20,11 @@ class NMTMSettings(bpy.types.PropertyGroup):
     image: PointerProperty(
         type=bpy.types.Image, name="法线贴图",
         description="贴图模式使用: 与当前网格 UV 对应的切线空间法线贴图")
-    disp_strength: FloatProperty(
-        name="强度", default=0.02, soft_min=-0.2, soft_max=0.2, step=1, precision=3,
-        description="位移强度(物体空间单位), 与 Displace 修改器 RGB→XYZ 语义一致: "
-                    "位移 = (烘焙法线颜色 − 0.5) × 强度; 负值反向")
+    disp_scale: FloatProperty(
+        name="高度倍数", default=1.0, soft_min=-3.0, soft_max=3.0, step=10, precision=2,
+        description="1.0 = 按法线坡度积分出的物理高度(物体空间单位, 高频细节自动"
+                    "获得与波长匹配的小高度)。完全平贴严格零位移(无整体膨胀), "
+                    "凹凸随倾斜方向正负; 负值整体反向")
     bake_size: EnumProperty(
         name="烘焙分辨率",
         items=(('512', "512", ""), ('1024', "1024", ""),
@@ -66,7 +67,7 @@ class NMTM_PT_panel(bpy.types.Panel):
         layout.prop(s, "source", text="来源")
         if s.source != 'MATERIAL':
             layout.template_ID(s, "image", open="image.open")
-        layout.prop(s, "disp_strength", slider=True)
+        layout.prop(s, "disp_scale", slider=True)
         row = layout.row()
         row.scale_y = 1.2
         row.operator("nmtm.build", icon='MOD_MULTIRES')
@@ -87,7 +88,7 @@ class NMTM_PT_panel(bpy.types.Panel):
             box.label(text="当前状态", icon='CHECKMARK')
             box.label(text=f"来源: {obj.get('nmtm_source', obj.get('nmtm_image', '?'))}")
             box.label(text=f"级别 {obj.get('nmtm_level', '?')} | "
-                           f"强度 {obj.get('nmtm_strength', 0.0):.3f}")
+                           f"倍数 {obj.get('nmtm_scale', 0.0):.2f}")
             box.operator("nmtm.remove", icon='TRASH')
 
 

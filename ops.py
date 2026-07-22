@@ -3,16 +3,18 @@
 # depsgraph 求值、numpy 向量位移、multires_reshape 写回。
 #
 # 流程(一键):
-#   1. 在物体自身材质(或按所选贴图临时搭的简单节点链)上, 用 Cycles 烘焙
-#      "物体空间法线"到临时浮点图——切线基/绿通道约定/通道重建/镜像 UV 岛
-#      全部由渲染器按材质真实节点求值; 结果按指纹缓存(调强度重跑零成本)。
-#   2. 自动算细分级别(烘焙分辨率 × UV 占用率 ≈ 四边形数, 受预算上限保护)。
-#   3. 建/重置 Multires → SIMPLE 细分 L 级(保形)。
-#   4. 关其它修改器 → depsgraph 求值细分基面 → 逐 loop 双线性采样烘焙图 →
-#      Displace(RGB_TO_XYZ) 同款向量位移 → 逐顶点平均。
+#   1. 用 Cycles EMIT 烘焙三张物体空间图(按指纹缓存): 带法线贴图的扰动法线 n1
+#      (材质 Normal Map 节点输出 / 所选贴图临时链)、纯平滑基准法线 n0
+#      (Geometry.Normal)、表面位置 P(Geometry.Position, 原始浮点)。
+#      切线基/绿通道约定/通道重建/镜像 UV 岛全部由渲染器按材质真实节点求值。
+#   2. 零猜测装配高度梯度 dh/du = (n0 − n1/(n1·n0))·∂P/∂u → FC 频域泊松积分
+#      → 物理高度场(物体单位); 平贴处梯度严格 0 → 高度 0, 无整体膨胀。
+#   3. 自动算细分级别 → 建/重置 Multires → SIMPLE 细分 L 级(保形)。
+#   4. 关其它修改器 → depsgraph 求值细分基面 → 逐 loop 采样高度 → 逐岛去趋势
+#      → 岛间缝合 → 逐顶点平均 → 沿基准法线位移 × 高度倍数。
 #   5. 临时物体 + multires_reshape 把绝对坐标写回 Multires 位移层 → 清理。
 #
-# 重复点"应用"= 从基面重建(幂等), 改强度即所见即所得。
+# 重复点"应用"= 从基面重建(幂等), 改倍数即所见即所得。
 
 import time
 
@@ -24,12 +26,13 @@ from . import core
 
 MAX_LEVELS = 9
 BAKE_MARGIN = 16
-BAKE_SAMPLES = 16
+BAKE_SAMPLES = 1   # EMIT 烘焙无噪声, 1 采样足够
 
-# 运行期缓存: (网格指纹, 材质, 来源, 分辨率) -> 烘焙的 (H, W, 3) float32 像素。
+# 运行期缓存: (网格指纹, 材质, 来源, 分辨率) -> 三张烘焙图 (n1, n0, P)。
 # 注意只认网格/材质"身份", 不追踪材质节点内容变化——本会话内改了材质请重开会话
 # 或换烘焙分辨率强制失效。
 _bake_cache = {}
+_island_cache = {}
 
 
 def _cache_put(cache, key, val, cap=2):
@@ -41,6 +44,7 @@ def _cache_put(cache, key, val, cap=2):
 
 def clear_caches():
     _bake_cache.clear()
+    _island_cache.clear()
 
 
 # ---------------------------------------------------------------------------
@@ -139,79 +143,76 @@ def _mesh_fingerprint(me, loop_uv):
     return (me.name_full, len(me.vertices), len(me.polygons), len(me.loops), fp)
 
 
-def _bake_object_normals(context, obj, source, image, bake_size, loop_uv):
-    """在物体材质上烘焙物体空间法线 → (H, W, 3) float32。按指纹缓存。
+def _build_encoder(nt, src_socket, vector_type='NORMAL', encode=True):
+    """向量(世界空间) → Vector Transform 转物体空间 → (可选 ×0.5+0.5 编码) → Emission。
 
-    烘焙期间临时: 切 Cycles(CPU)、隐藏其它物体、关掉本物体全部修改器的渲染求值
-    (烘出静息态基面法线, 与写进 Multires 的位移空间一致)、往材质插烘焙目标节点。
-    结束后全部还原。
+    法线用 NORMAL 类型+编码; 位置用 POINT 类型+原始浮点(float 图保 HDR)。
+    返回 (新建节点列表, emission 节点)。调用方负责把 emission 接到材质输出并清理。
+    """
+    vt = nt.nodes.new('ShaderNodeVectorTransform')
+    vt.vector_type = vector_type
+    vt.convert_from = 'WORLD'
+    vt.convert_to = 'OBJECT'
+    nt.links.new(vt.inputs['Vector'], src_socket)
+    nodes = [vt]
+    out_socket = vt.outputs['Vector']
+    if encode:
+        vm = nt.nodes.new('ShaderNodeVectorMath')
+        vm.operation = 'MULTIPLY_ADD'
+        vm.inputs[1].default_value = (0.5, 0.5, 0.5)
+        vm.inputs[2].default_value = (0.5, 0.5, 0.5)
+        nt.links.new(vm.inputs[0], out_socket)
+        out_socket = vm.outputs['Vector']
+        nodes.append(vm)
+    em = nt.nodes.new('ShaderNodeEmission')
+    nt.links.new(em.inputs['Color'], out_socket)
+    nodes.append(em)
+    return nodes, em
+
+
+def _bake_once(context, obj, kind, source, image, bake_size):
+    """单次物体空间 EMIT 烘焙 → (H, W, 3) float32。
+
+    Blender 5.x 的 Cycles NORMAL 烘焙只输出几何平滑法线, **不含**材质法线贴图
+    扰动(实测两图逐位相同), 因此用 EMIT 发射色编码烘出所需向量。
+    kind='DETAIL': 扰动法线 n1——MATERIAL 来源把每个材质的 Normal Map 节点输出
+                   临时接进编码链(无 Normal Map 的材质接 Geometry.Normal → 零梯度);
+                   IMAGE 来源用所选贴图临时搭 TexImage→NormalMap→编码链。
+    kind='BASELINE': 基准法线 n0——全部槽临时换 Geometry.Normal 编码链。
+    kind='POSITION': 表面位置 P——全部槽临时换 Geometry.Position 原始浮点链。
+    场景/选中/隐藏/修改器状态由 _bake_triple 负责; 本函数管材质/节点/目标图, 结束全还原。
     """
     me = obj.data
-    mats = tuple(s.material.name_full if s.material else '' for s in obj.material_slots)
-    key = (_mesh_fingerprint(me, loop_uv), mats, source,
-           image.name_full if image is not None else '', int(bake_size))
-    got = _bake_cache.get(key)
-    if got is not None:
-        return got
-
-    if source == 'MATERIAL':
-        for slot in obj.material_slots:
-            if slot.material is not None and slot.material.library is not None:
-                raise RuntimeError(
-                    f"材质 '{slot.material.name}' 来自链接库, 无法插入烘焙节点; 请先 Make Local")
-
-    scene = context.scene
-    saved_scene = (scene.render.engine, scene.cycles.device, scene.cycles.samples,
-                   scene.cycles.bake_type, scene.render.bake.use_selected_to_active,
-                   scene.render.bake.margin, scene.render.bake.normal_space)
-    saved_hide = [(o.name, o.hide_render) for o in bpy.data.objects]
-    saved_show_render = [(m.name, m.show_render) for m in obj.modifiers]
+    bake_img = None
+    tmp_mat = None
     saved_slots = None
     slot_appended = False
-    tmp_mat = None
-    bake_img = None
-    inserted = []   # (材质名, 烘焙节点名, 原active节点名)
+    inserted = []   # (材质名, 烘焙目标节点名, 原active节点名)
+    grafts = []     # (材质名, [临时节点名], 输出节点名, (原surface来源节点名, 输出口名)|None)
     try:
-        scene.render.engine = 'CYCLES'
-        scene.cycles.device = 'CPU'
-        scene.cycles.samples = BAKE_SAMPLES
-        scene.cycles.bake_type = 'NORMAL'
-        scene.render.bake.use_selected_to_active = False
-        scene.render.bake.margin = BAKE_MARGIN
-        scene.render.bake.normal_space = 'OBJECT'
-
-        for o in bpy.data.objects:
-            o.hide_render = True
-        obj.hide_render = False
-        for o in list(context.selected_objects):
-            o.select_set(False)
-        obj.select_set(True)
-        context.view_layer.objects.active = obj
-        for m in obj.modifiers:
-            m.show_render = False
-
-        bake_img = bpy.data.images.new("NMTM_bake", width=bake_size, height=bake_size,
-                                       float_buffer=True)
+        bake_img = bpy.data.images.new(f"NMTM_bake_{kind}", width=bake_size,
+                                       height=bake_size, float_buffer=True)
         bake_img.colorspace_settings.name = 'Non-Color'
 
-        if source == 'IMAGE':
-            # 法线贴图按惯例应为 Non-Color(仅文件图: 改生成型图的色彩空间会清掉像素)
-            try:
-                if image.source == 'FILE' and image.colorspace_settings.name != 'Non-Color':
-                    image.colorspace_settings.name = 'Non-Color'
-            except Exception:
-                pass
+        if kind != 'DETAIL' or source == 'IMAGE':
             tmp_mat = bpy.data.materials.new("NMTM_bake_mat")
             nt = tmp_mat.node_tree
             nt.nodes.clear()
             out = nt.nodes.new('ShaderNodeOutputMaterial')
-            bsdf = nt.nodes.new('ShaderNodeBsdfDiffuse')
-            nmap = nt.nodes.new('ShaderNodeNormalMap')
-            timg = nt.nodes.new('ShaderNodeTexImage')
-            timg.image = image
-            nt.links.new(nmap.inputs['Color'], timg.outputs['Color'])
-            nt.links.new(bsdf.inputs['Normal'], nmap.outputs['Normal'])
-            nt.links.new(out.inputs['Surface'], bsdf.outputs['BSDF'])
+            if kind == 'DETAIL':
+                timg = nt.nodes.new('ShaderNodeTexImage')
+                timg.image = image
+                nmap = nt.nodes.new('ShaderNodeNormalMap')
+                nt.links.new(nmap.inputs['Color'], timg.outputs['Color'])
+                src_socket, vtype, enc = nmap.outputs['Normal'], 'NORMAL', True
+            elif kind == 'BASELINE':
+                geo = nt.nodes.new('ShaderNodeNewGeometry')
+                src_socket, vtype, enc = geo.outputs['Normal'], 'NORMAL', True
+            else:   # POSITION
+                geo = nt.nodes.new('ShaderNodeNewGeometry')
+                src_socket, vtype, enc = geo.outputs['Position'], 'POINT', False
+            _, em = _build_encoder(nt, src_socket, vtype, enc)
+            nt.links.new(out.inputs['Surface'], em.outputs['Emission'])
             for n in nt.nodes:
                 n.select = False
             target = nt.nodes.new('ShaderNodeTexImage')
@@ -233,6 +234,31 @@ def _bake_object_normals(context, obj, source, image, bake_size, loop_uv):
                     continue
                 done.add(mat.name)
                 nt = mat.node_tree
+                out_node = nt.get_output_node('CYCLES')
+                if out_node is None:
+                    continue
+                surf = out_node.inputs['Surface']
+                orig_from = None
+                if surf.is_linked:
+                    lk = surf.links[0]
+                    orig_from = (lk.from_node.name, lk.from_socket.name)
+                nmap_names = [n.name for n in nt.nodes if n.type == 'NORMAL_MAP']
+                if len(nmap_names) > 1:
+                    print(f"[NormalMapToMesh] 警告: 材质 '{mat.name}' 有 "
+                          f"{len(nmap_names)} 个 Normal Map 节点, 取第一个")
+                new_nodes = []
+                if nmap_names:
+                    src_socket = nt.nodes[nmap_names[0]].outputs['Normal']
+                else:
+                    geo = nt.nodes.new('ShaderNodeNewGeometry')
+                    new_nodes.append(geo)
+                    src_socket = geo.outputs['Normal']
+                enc_nodes, em = _build_encoder(nt, src_socket)
+                new_nodes.extend(enc_nodes)
+                nt.links.new(out_node.inputs['Surface'], em.outputs['Emission'])
+                grafts.append((mat.name, [n.name for n in new_nodes],
+                               out_node.name, orig_from))
+
                 prev_active = nt.nodes.active.name if nt.nodes.active else ''
                 # bpy 集合迭代出的是新包装对象, `is` 比较恒假——先全清再对持有的原始引用赋值
                 for n in nt.nodes:
@@ -244,14 +270,33 @@ def _bake_object_normals(context, obj, source, image, bake_size, loop_uv):
                 nt.nodes.active = target
                 inserted.append((mat.name, target.name, prev_active))
 
-        bpy.ops.object.bake(type='NORMAL')
+        bpy.ops.object.bake(type='EMIT')
 
         buf = np.empty(bake_size * bake_size * 4, np.float32)
         bake_img.pixels.foreach_get(buf)
         rgb = buf.reshape(bake_size, bake_size, 4)[..., :3].astype(np.float32, copy=True)
         if float(rgb.std()) < 1e-5:
-            raise RuntimeError("烘焙结果是纯色, 物体空间法线烘焙未生效(检查材质与 UV)")
+            raise RuntimeError(f"{kind} 烘焙结果是纯色, 物体空间法线烘焙未生效(检查材质与 UV)")
+        return rgb
     finally:
+        for mat_name, node_names, out_name, orig_from in grafts:
+            mat = bpy.data.materials.get(mat_name)
+            if mat is None:
+                continue
+            nt = mat.node_tree
+            for nn in node_names:
+                n = nt.nodes.get(nn)
+                if n is not None:
+                    nt.nodes.remove(n)
+            if orig_from is not None:
+                out_node = nt.nodes.get(out_name)
+                from_node = nt.nodes.get(orig_from[0])
+                if out_node is not None and from_node is not None:
+                    try:
+                        nt.links.new(out_node.inputs['Surface'],
+                                     from_node.outputs[orig_from[1]])
+                    except Exception:
+                        pass
         for mat_name, node_name, prev_active in inserted:
             mat = bpy.data.materials.get(mat_name)
             if mat is None:
@@ -273,6 +318,63 @@ def _bake_object_normals(context, obj, source, image, bake_size, loop_uv):
             bpy.data.materials.remove(tmp_mat)
         if bake_img is not None:
             bpy.data.images.remove(bake_img)
+
+
+def _bake_triple(context, obj, source, image, bake_size, loop_uv):
+    """三次同参数物体空间 EMIT 烘焙(n1, n0, P) → 三张 (H,W,3)。按指纹缓存。
+
+    烘焙期间临时: 切 Cycles(CPU)、隐藏其它物体、关掉本物体全部修改器的渲染求值
+    (烘出静息态基面数据, 与写进 Multires 的位移空间一致)。结束后全部还原。
+    """
+    me = obj.data
+    mats = tuple(s.material.name_full if s.material else '' for s in obj.material_slots)
+    key = (_mesh_fingerprint(me, loop_uv), mats, source,
+           image.name_full if image is not None else '', int(bake_size))
+    got = _bake_cache.get(key)
+    if got is not None:
+        return got
+
+    if source == 'MATERIAL':
+        for slot in obj.material_slots:
+            if slot.material is not None and slot.material.library is not None:
+                raise RuntimeError(
+                    f"材质 '{slot.material.name}' 来自链接库, 无法插入烘焙节点; 请先 Make Local")
+    if source == 'IMAGE':
+        # 法线贴图按惯例应为 Non-Color(仅文件图: 改生成型图的色彩空间会清掉像素)
+        try:
+            if image.source == 'FILE' and image.colorspace_settings.name != 'Non-Color':
+                image.colorspace_settings.name = 'Non-Color'
+        except Exception:
+            pass
+
+    scene = context.scene
+    saved_scene = (scene.render.engine, scene.cycles.device, scene.cycles.samples,
+                   scene.cycles.bake_type, scene.render.bake.use_selected_to_active,
+                   scene.render.bake.margin, scene.render.bake.normal_space)
+    saved_hide = [(o.name, o.hide_render) for o in bpy.data.objects]
+    saved_show_render = [(m.name, m.show_render) for m in obj.modifiers]
+    try:
+        scene.render.engine = 'CYCLES'
+        scene.cycles.device = 'CPU'
+        scene.cycles.samples = BAKE_SAMPLES
+        scene.cycles.bake_type = 'EMIT'
+        scene.render.bake.use_selected_to_active = False
+        scene.render.bake.margin = BAKE_MARGIN
+
+        for o in bpy.data.objects:
+            o.hide_render = True
+        obj.hide_render = False
+        for o in list(context.selected_objects):
+            o.select_set(False)
+        obj.select_set(True)
+        context.view_layer.objects.active = obj
+        for m in obj.modifiers:
+            m.show_render = False
+
+        rgb_detail = _bake_once(context, obj, 'DETAIL', source, image, bake_size)
+        rgb_base = _bake_once(context, obj, 'BASELINE', source, None, bake_size)
+        pos_map = _bake_once(context, obj, 'POSITION', source, None, bake_size)
+    finally:
         for name, vis in saved_hide:
             o = bpy.data.objects.get(name)
             if o is not None:
@@ -285,8 +387,21 @@ def _bake_object_normals(context, obj, source, image, bake_size, loop_uv):
          scene.cycles.bake_type, scene.render.bake.use_selected_to_active,
          scene.render.bake.margin, scene.render.bake.normal_space) = saved_scene
 
-    _cache_put(_bake_cache, key, rgb)
-    return rgb
+    triple = (rgb_detail, rgb_base, pos_map)
+    _cache_put(_bake_cache, key, triple)
+    return triple
+
+
+def _get_island_labels(me, loop_vert, loop_uv, loop_total):
+    """基面 → UV 岛标签(按网格内容指纹缓存)。"""
+    fp = hash(loop_uv[:: max(1, loop_uv.shape[0] // 4096)].tobytes())
+    key = (me.name_full, len(me.polygons), len(me.loops), fp)
+    got = _island_cache.get(key)
+    if got is None:
+        poly_of_loop = np.repeat(np.arange(len(me.polygons), dtype=np.int64), loop_total)
+        got = core.face_islands(loop_vert, loop_uv, poly_of_loop, len(me.polygons))
+        _cache_put(_island_cache, key, got)
+    return got
 
 
 # ---------------------------------------------------------------------------
@@ -325,10 +440,19 @@ def build(context, obj, s, report):
 
     source = _resolve_source(obj, s)
     loop_uv = _read_loop_uvs(me)
+    loop_vert = _read_loop_verts(me)
     bake_size = int(s.bake_size)
-    rgb = _bake_object_normals(context, obj, source,
-                               s.image if source == 'IMAGE' else None,
-                               bake_size, loop_uv)
+    rgb_detail, rgb_base, pos_map = _bake_triple(context, obj, source,
+                                                 s.image if source == 'IMAGE' else None,
+                                                 bake_size, loop_uv)
+
+    # 零猜测高度重建: 梯度 = (n0 − n1/(n1·n0))·∂P/∂{u,v} → 频域泊松积分(物理单位)
+    gx, gy, wmap = core.height_gradients(rgb_detail, rgb_base, pos_map)
+    field = core.integrate_height(gx, gy)
+    if not (wmap > 0).any():
+        raise RuntimeError("烘焙图全部无效(法线长度异常), 高度重建失败")
+    print(f"[NormalMapToMesh] 梯度有效率 {wmap.mean():.1%} | "
+          f"高度场 p95 {np.percentile(np.abs(field[wmap > 0]), 95) * 1000:.2f}‰")
     t_bake = time.perf_counter()
 
     fill = _uv_fill(me, loop_uv)
@@ -382,15 +506,42 @@ def build(context, obj, s, report):
         lv2 = _read_loop_verts(tmp_me)
         uv2 = _read_loop_uvs(tmp_me)
 
-        # 逐 loop 采样烘焙图 → Displace(RGB_TO_XYZ) 同款物体空间向量位移
-        rgb_loop = core.sample_bilinear_wrap(rgb, uv2[:, 0], uv2[:, 1])
-        offset_loop = core.displace_rgb_to_xyz(rgb_loop, s.disp_strength)
-        offset_vert = core.average_loop_vectors_to_verts(offset_loop, lv2, vcount)
+        # 逐 loop 采样(高度 + 基准法线 + 有效权重, 拼一次采样)
+        samp = np.concatenate([field[..., None], rgb_base, wmap[..., None]], axis=2)
+        s5 = core.sample_bilinear_wrap(samp, uv2[:, 0], uv2[:, 1])
+        h_loop = s5[:, 0].astype(np.float32)
+        n0_loop, w0_loop = core.decode_unit_normal(s5[:, 1:4])
+        w_loop = (s5[:, 4] > 0.5).astype(np.float32) * w0_loop
+
+        # 逐岛去趋势+缝合: 全局积分给每岛留下的任意偏移/斜坡, 用基面拓扑映射
+        # (细分面按基面连续分块)精确归岛后消除
+        loop_total = np.empty(len(me.polygons), np.int32)
+        me.polygons.foreach_get("loop_total", loop_total)
+        labels, n_islands = _get_island_labels(me, loop_vert, loop_uv, loop_total)
+        per_face = loop_total.astype(np.int64) * (4 ** (level - 1))
+        island_of_loop2 = np.repeat(np.repeat(labels, per_face), 4)
+        if island_of_loop2.shape[0] != h_loop.shape[0]:
+            raise RuntimeError(
+                f"细分拓扑映射失配: {island_of_loop2.shape[0]:,} vs {h_loop.shape[0]:,}")
+        h_loop = core.detrend_per_island(h_loop, uv2, island_of_loop2, n_islands, 'PLANE')
+        h_loop = core.stitch_islands(h_loop, lv2, island_of_loop2, n_islands)
+        h_loop *= w_loop   # 无效采样(未烘焙背景)不位移
+
+        # 沿基准法线位移 × 高度倍数
+        h_vert = core.average_loops_to_verts(h_loop, lv2, vcount)
+        n0_vert = core.average_loop_vectors_to_verts(n0_loop * w_loop[:, None], lv2, vcount)
+        ln = np.linalg.norm(n0_vert, axis=1)
+        n0_vert /= np.maximum(ln, 1e-6)[:, None]
+        amp_vert = h_vert * np.float32(s.disp_scale) * (ln > 0.1).astype(np.float32)
 
         co = _read_vert_cos(tmp_me)
-        co += offset_vert
+        co += n0_vert * amp_vert[:, None]
         tmp_me.vertices.foreach_set("co", co.ravel())
         tmp_me.update()
+        mag = np.abs(amp_vert)
+        disp_stat = (f"{n_islands} 岛 | 位移幅值 p50 {np.percentile(mag, 50) * 1000:.2f} / "
+                     f"p95 {np.percentile(mag, 95) * 1000:.2f} / "
+                     f"max {mag.max() * 1000:.2f} (千分之一物体单位)")
         t_displace = time.perf_counter()
 
         # ---- reshape 写回 Multires 位移层 ----
@@ -422,11 +573,12 @@ def build(context, obj, s, report):
     obj["nmtm_level"] = level
     obj["nmtm_source"] = ("材质法线链" if source == 'MATERIAL'
                           else (s.image.name if s.image is not None else '?'))
-    obj["nmtm_strength"] = float(s.disp_strength)
+    obj["nmtm_scale"] = float(s.disp_scale)
 
     t_end = time.perf_counter()
     msg = (f"{'材质' if source == 'MATERIAL' else '贴图'}烘焙 {bake_size}px | 级别 {level} | "
-           f"{quads:,} 四边形 | 烘焙 {t_bake - t0:.1f}s + 细分 {t_subdiv - t_bake:.1f}s + "
+           f"{quads:,} 四边形 | {disp_stat} | "
+           f"烘焙 {t_bake - t0:.1f}s + 细分 {t_subdiv - t_bake:.1f}s + "
            f"位移 {t_displace - t_subdiv:.1f}s + 写回 {t_end - t_displace:.1f}s "
            f"= {t_end - t0:.1f}s")
     print(f"[NormalMapToMesh] {obj.name}: {msg}")
@@ -514,7 +666,8 @@ class NMTM_OT_remove(bpy.types.Operator):
                 mod.sculpt_levels = 0
                 bpy.ops.object.multires_higher_levels_delete(modifier=mod.name)
             bpy.ops.object.modifier_remove(modifier=mod.name)
-        for k in ("nmtm_owned", "nmtm_level", "nmtm_image", "nmtm_source", "nmtm_strength"):
+        for k in ("nmtm_owned", "nmtm_level", "nmtm_image", "nmtm_source",
+                  "nmtm_strength", "nmtm_scale"):
             if k in obj.keys():
                 del obj[k]
         self.report({'INFO'}, "已恢复低模")

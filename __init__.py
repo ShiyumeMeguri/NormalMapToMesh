@@ -2,12 +2,13 @@
 bl_info = {
     "name": "Normal Map To Mesh (法线→多级精度高模)",
     "author": "Ruri",
-    "version": (2, 0, 0),
+    "version": (3, 0, 0),
     "blender": (4, 2, 0),
     "location": "3D视图 > 侧栏(N) > Ruri",
-    "description": "把法线贴图经 Cycles 物体空间法线烘焙 + Displace(RGB→XYZ) 同款向量位移 "
-                   "重建为 Multires 高模细节, 一键自动细分+位移+写回; 切线基/绿通道约定/"
-                   "镜像 UV 岛全部由渲染器按材质真实节点求值",
+    "description": "法线贴图 → Multires 高模: Cycles EMIT 三图烘焙(扰动法线/基准法线/位置)"
+                   "零猜测装配高度梯度, 频域泊松积分出物理高度, 逐岛去趋势+缝合后沿基准"
+                   "法线位移。平贴严格零位移, 高频细节自动获得匹配波长的小高度, 倍数可调; "
+                   "切线基/绿通道约定/镜像 UV 岛全部由渲染器按材质真实节点求值",
     "category": "Mesh",
 }
 
