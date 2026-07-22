@@ -771,6 +771,73 @@ def _eval_simple_coords(context, obj, level):
     return coords
 
 
+def _phong_normals_for_loops(me, loop_uv, uv2, base_face_of_loop2, fallback_nrm):
+    """shader 等价法线场: 逐细分 loop 在其基面的扇形三角化里按 UV 重心插值
+    基面平滑角法线——面内解析光滑(Phong), 与渲染器逐像素插值同构。
+
+    细分网格自己重算的角法线是离散近似(SIMPLE 下面内恒为面法线, 逐基面跳变),
+    位移方向用它会把离散噪声刻进表面; 插值基面法线才是"SDF 场式"的光滑求值。
+    UV 退化/数值失败的 loop 回退 fallback_nrm(细分网格角法线)。
+    """
+    n_base = len(me.loops)
+    nrm = np.empty(n_base * 3, np.float32)
+    me.corner_normals.foreach_get("vector", nrm)
+    nrm = nrm.reshape(-1, 3).astype(np.float64)
+
+    loop_start = np.empty(len(me.polygons), np.int64)
+    me.polygons.foreach_get("loop_start", loop_start)
+    loop_total = np.empty(len(me.polygons), np.int64)
+    me.polygons.foreach_get("loop_total", loop_total)
+
+    f = base_face_of_loop2
+    ls = loop_start[f]
+    lt = loop_total[f]
+    n2 = uv2.shape[0]
+    out = np.zeros((n2, 3), np.float64)
+    found = np.zeros(n2, bool)
+    uv = loop_uv.astype(np.float64)
+    p = uv2.astype(np.float64)
+    eps = 1e-4
+    max_fan = int(loop_total.max()) - 2
+    for k in range(max_fan):
+        act = np.flatnonzero((~found) & (k < lt - 2))
+        if act.size == 0:
+            break
+        i0 = ls[act]
+        i1 = i0 + k + 1
+        i2 = i0 + k + 2
+        a = uv[i0]
+        b = uv[i1]
+        c = uv[i2]
+        pa = p[act] - a
+        e1 = b - a
+        e2 = c - a
+        det = e1[:, 0] * e2[:, 1] - e1[:, 1] * e2[:, 0]
+        ok_det = np.abs(det) > 1e-14
+        det_s = np.where(ok_det, det, 1.0)
+        l1 = (pa[:, 0] * e2[:, 1] - pa[:, 1] * e2[:, 0]) / det_s
+        l2 = (e1[:, 0] * pa[:, 1] - e1[:, 1] * pa[:, 0]) / det_s
+        l0 = 1.0 - l1 - l2
+        last = k >= (lt[act] - 3)   # 最后一块扇形: 夹取兜底(数值边界不落空)
+        inside = ok_det & (((l0 >= -eps) & (l1 >= -eps) & (l2 >= -eps)) | last)
+        if not inside.any():
+            continue
+        sel = act[inside]
+        w0 = np.clip(l0[inside], 0.0, 1.0)
+        w1 = np.clip(l1[inside], 0.0, 1.0)
+        w2 = np.clip(l2[inside], 0.0, 1.0)
+        vec = (nrm[i0[inside]] * w0[:, None] + nrm[i1[inside]] * w1[:, None]
+               + nrm[i2[inside]] * w2[:, None])
+        out[sel] = vec
+        found[sel] = True
+    ln = np.linalg.norm(out, axis=1)
+    bad = (~found) | (ln < 1e-6)
+    if bad.any():
+        out[bad] = fallback_nrm[bad]
+        ln = np.linalg.norm(out, axis=1)
+    return (out / np.maximum(ln, 1e-12)[:, None]).astype(np.float32)
+
+
 def _get_island_labels(me, loop_vert, loop_uv, loop_total):
     """基面 → UV 岛标签(按网格内容指纹缓存)。"""
     fp = hash(loop_uv[:: max(1, loop_uv.shape[0] // 4096)].tobytes())
@@ -878,17 +945,17 @@ def _build_inner(context, obj, s, report, t0):
     level = max(1, level)
     quads = len(me.loops) * (4 ** (level - 1))
 
-    # ---- 高斯预滤 + FC 积分 ----
-    # σ 下限 = 顶点 Nyquist: 顶点间距粗于 texel 时(欠采样), texel 级抖动会混叠
-    # 成表面颗粒——带限是下限保障, 用户的"表面平滑"只能在其上加码
+    # ---- FC 积分 (无风格化模糊) ----
+    # 唯一的带限 = 顶点 Nyquist 抗混叠下限(采样理论要求, 非平滑参数):
+    # 顶点间距粗于 texel 时, texel 级信号无法被网格表达, 不滤除即成混叠颗粒;
+    # 自动级别(1 四边形/texel)下该下限为 0——完全无损
     texels_per_edge = float(np.sqrt(bake_size * bake_size * fill / max(quads, 1)))
     sigma_floor = 0.6 * texels_per_edge if texels_per_edge > 1.0 else 0.0
-    smooth_px_eff = max(float(s.smooth_px), sigma_floor)
     field = core.integrate_height(
-        gx, gy, 0.0, (smooth_px_eff / bake_size) if smooth_px_eff > 0 else 0.0)
+        gx, gy, 0.0, (sigma_floor / bake_size) if sigma_floor > 0 else 0.0)
     print(f"[NormalMapToMesh] 梯度有效率 {wmap.mean():.1%} | "
           f"高度场 p95 {np.percentile(np.abs(field[wmap > 0]), 95) * 1000:.2f}‰ | "
-          f"σ {smooth_px_eff:.2f}px (下限 {sigma_floor:.2f})")
+          f"抗混叠下限 σ {sigma_floor:.2f}px")
 
     # ---- 建层(只为 Multires 数据结构; reshape 会完整覆写 MDISPS) ----
     # 层数已匹配则整段跳过(重建快路径); 建层在隐藏态跑——细分面从此只当
@@ -951,14 +1018,8 @@ def _build_inner(context, obj, s, report, t0):
         s2 = core.sample_bspline_wrap(samp, uv2[:, 0], uv2[:, 1])
         h_loop = s2[:, 0].astype(np.float32)
         w_loop = (s2[:, 1] > 0.5).astype(np.float32)
-        # 位移方向 = 各 loop 自己网格的平滑角法线(shader 等价求值; 不走共享网格,
-        # 镜像岛/背面方向天然正确, 无赢家马赛克)
-        n0_loop = np.empty(len(tmp_me.loops) * 3, np.float32)
-        tmp_me.corner_normals.foreach_get("vector", n0_loop)
-        n0_loop = n0_loop.reshape(-1, 3)
 
-        # 逐岛去趋势+缝合: 全局积分给每岛留下的任意偏移/斜坡, 用基面拓扑映射
-        # (细分面按基面连续分块)精确归岛后消除
+        # 基面拓扑映射(细分面按基面连续分块) → 岛标签 + 逐 loop 基面号
         loop_total = np.empty(len(me.polygons), np.int32)
         me.polygons.foreach_get("loop_total", loop_total)
         labels, n_islands = _get_island_labels(me, loop_vert, loop_uv, loop_total)
@@ -967,6 +1028,15 @@ def _build_inner(context, obj, s, report, t0):
         if island_of_loop2.shape[0] != h_loop.shape[0]:
             raise RuntimeError(
                 f"细分拓扑映射失配: {island_of_loop2.shape[0]:,} vs {h_loop.shape[0]:,}")
+        base_face_of_loop2 = np.repeat(
+            np.repeat(np.arange(len(me.polygons), dtype=np.int64), per_face), 4)
+
+        # 位移方向 = 基面平滑角法线在表面插值位置的 Phong 插值(shader 等价的
+        # 解析光滑法线场)——细分网格重算的角法线是离散近似, 会刻入面级噪声
+        fb = np.empty(len(tmp_me.loops) * 3, np.float32)
+        tmp_me.corner_normals.foreach_get("vector", fb)
+        n0_loop = _phong_normals_for_loops(me, loop_uv, uv2, base_face_of_loop2,
+                                           fb.reshape(-1, 3).astype(np.float64))
         h_loop = core.detrend_per_island(h_loop, uv2, island_of_loop2, n_islands, 'PLANE')
         h_loop = core.stitch_islands(h_loop, lv2, island_of_loop2, n_islands)
         h_loop *= w_loop   # 无效采样(未覆盖背景)不位移
@@ -1029,7 +1099,21 @@ def _build_inner(context, obj, s, report, t0):
                 for _ in range(k_rings):
                     np.minimum.at(dist, e1, dist[e0] + 1)
                     np.minimum.at(dist, e0, dist[e1] + 1)
-                wgt = np.clip(1.0 - dist.astype(np.float32) / k_rings, 0.0, 1.0)
+                # smoothstep(C1) + 图扩散: 整数环的线性渐变在每环边界有导数跳变,
+                # 会沿所有卡片边缘拉出脊线——抹成连续混合场(端点钉死)
+                s_lin = np.clip(1.0 - dist.astype(np.float32) / k_rings, 0.0, 1.0)
+                wgt = (s_lin * s_lin * (3.0 - 2.0 * s_lin)).astype(np.float32)
+                deg_w = (np.bincount(e0, minlength=vcount)
+                         + np.bincount(e1, minlength=vcount)).astype(np.float64)
+                deg_w = np.maximum(deg_w, 1.0)
+                pin1 = dist == 0
+                pin0 = dist > k_rings
+                for _ in range(4):
+                    sw = (np.bincount(e0, weights=wgt[e1], minlength=vcount)
+                          + np.bincount(e1, weights=wgt[e0], minlength=vcount))
+                    wgt = (0.5 * wgt + 0.5 * (sw / deg_w)).astype(np.float32)
+                    wgt[pin1] = 1.0
+                    wgt[pin0] = 0.0
                 corr = (coords_simple - co) * wgt[:, None]
                 co += corr
                 corr_stat = (f" | CC边界校正 max "
