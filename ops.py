@@ -1072,13 +1072,20 @@ def _build_inner(context, obj, s, report, t0):
         n0_loop = (n_ph / np.maximum(np.linalg.norm(n_ph, axis=1), 1e-12)[:, None]
                    ).astype(np.float32)
 
-        d_c = p_lin_loop[:, None, :] - p_c
-        dot_c = np.einsum('lcj,lcj->lc', d_c, n_c)
-        proj = p_lin_loop[:, None, :] - dot_c[..., None] * n_c
-        p_star = np.einsum('lc,lcj->lj', w3, proj)
-        bulge_loop = (np.float32(PHONG_ALPHA) * (p_star - p_lin_loop)).astype(np.float32)
-        bulge_loop[bad] = 0.0
-        del n_c, p_c, d_c, dot_c, proj, p_star
+        # 'INTERP_NORMAL' 模式: 基面保持纯线性(不鼓起), 只把插值法线场用于位移
+        # 方向, 视觉平滑完全交给 shade_smooth 的着色插值——排查 Phong 鼓起是否
+        # 是"每个面片独立轻微鼓起"观感的来源时用于对比
+        if s.surface_mode == 'PHONG_BULGE':
+            d_c = p_lin_loop[:, None, :] - p_c
+            dot_c = np.einsum('lcj,lcj->lc', d_c, n_c)
+            proj = p_lin_loop[:, None, :] - dot_c[..., None] * n_c
+            p_star = np.einsum('lc,lcj->lj', w3, proj)
+            bulge_loop = (np.float32(PHONG_ALPHA) * (p_star - p_lin_loop)).astype(np.float32)
+            bulge_loop[bad] = 0.0
+            del d_c, dot_c, proj, p_star
+        else:
+            bulge_loop = np.zeros_like(p_lin_loop)
+        del n_c, p_c
 
         h_loop = core.detrend_per_island(h_loop, uv2, island_of_loop2, n_islands, 'PLANE')
         h_loop = core.stitch_islands(h_loop, lv2, island_of_loop2, n_islands)
@@ -1130,7 +1137,7 @@ def _build_inner(context, obj, s, report, t0):
         t_np2 = time.perf_counter()
         bulge_stat = ""
         wgt_bulge = np.ones(vcount, np.float32)
-        if boundary_verts.size and ecount:
+        if s.surface_mode == 'PHONG_BULGE' and boundary_verts.size and ecount:
             k_rings = max(2, 2 ** (level - 1))
             dist = np.full(vcount, k_rings + 1, np.int32)
             dist[boundary_verts] = 0

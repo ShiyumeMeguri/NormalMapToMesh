@@ -20,6 +20,17 @@ class NMTMSettings(bpy.types.PropertyGroup):
     image: PointerProperty(
         type=bpy.types.Image, name="法线贴图",
         description="贴图模式使用: 与当前网格 UV 对应的切线空间法线贴图")
+    surface_mode: EnumProperty(
+        name="基面曲率",
+        items=(('PHONG_BULGE', "Phong 鼓起",
+                "线性基面按 Phong Tessellation 解析鼓起(渲染平滑法线暗示的弯曲曲面); "
+                "低模三角形较大/曲率较强时, 因逐三角形独立鼓起、跨面曲率不连续, "
+                "可能观感为'每片轻微独立鼓包'而非连续圆滑(PN 曲面的已知局限)"),
+               ('INTERP_NORMAL', "插值法线(不鼓起)",
+                "基面保持纯线性(不额外弯曲), 只用插值法线场做细节位移方向, "
+                "整体平滑观感完全依赖渲染着色插值(shade smooth), 不改变实际几何弯曲")),
+        default='INTERP_NORMAL',
+        description="高模基面(细节位移之外)的弯曲方式")
     disp_scale: FloatProperty(
         name="高度倍数", default=1.0, soft_min=-3.0, soft_max=3.0, step=10, precision=2,
         description="1.0 = 按法线坡度积分出的物理高度(物体空间单位, 高频细节自动"
@@ -78,6 +89,7 @@ class NMTM_PT_panel(bpy.types.Panel):
 
         box = layout.box()
         box.label(text="选项", icon='PREFERENCES')
+        box.prop(s, "surface_mode", text="基面")
         box.prop(s, "edge_smooth_iters")
         box.prop(s, "deadzone_lsb")
         box.prop(s, "slope_limit")
