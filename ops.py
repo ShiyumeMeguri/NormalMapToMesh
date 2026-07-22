@@ -134,6 +134,57 @@ def _resolve_source(obj, s):
     raise RuntimeError("物体材质没有 Normal Map 节点, 也没有选择贴图——两者需有其一")
 
 
+def _upstream_image_sizes(start_socket, seen=None):
+    """从某 socket 沿输入连线向上游 BFS, 收集经过的 Image Texture 节点分辨率。"""
+    if seen is None:
+        seen = set()
+    sizes = []
+    stack = [start_socket]
+    while stack:
+        sock = stack.pop()
+        if not sock.is_linked:
+            continue
+        node = sock.links[0].from_node
+        key = (node.id_data.name_full, node.name)
+        if key in seen:
+            continue
+        seen.add(key)
+        if node.type == 'TEX_IMAGE' and node.image is not None:
+            w, h = node.image.size
+            if w > 0 and h > 0:
+                sizes.append(max(w, h))
+        # 节点组内部不展开(求值器本身也不支持 GROUP, 命中即整体回退烘焙路径;
+        # 分辨率探测保守跳过, 不影响正确性, 只影响自动选到的工作分辨率)
+        for inp in node.inputs:
+            stack.append(inp)
+    return sizes
+
+
+def _native_resolution(obj, source, image):
+    """工作分辨率 = 实际接入的法线贴图原生分辨率, 不再由用户猜数字。
+
+    高于源贴图分辨率的网格只是把已有像素插值放大, 不产生任何新细节还多耗算力;
+    低于源分辨率则白白丢弃作者烘焙进贴图的信息。两者都没有意义, 直接对齐现实。
+    MATERIAL 来源沿每个材质 Normal Map 节点的 Color 输入网络回溯, 取所有材质槽
+    命中的最大分辨率(多材质共享同一张工作网格); 找不到则回退 2048。
+    """
+    if source == 'IMAGE':
+        w, h = image.size
+        return max(w, h, 64)
+    sizes = []
+    for slot in obj.material_slots:
+        mat = slot.material
+        if mat is None or mat.node_tree is None:
+            continue
+        for n in mat.node_tree.nodes:
+            if n.type == 'NORMAL_MAP':
+                sizes.extend(_upstream_image_sizes(n.inputs['Color']))
+    if not sizes:
+        print("[NormalMapToMesh] 警告: 未在材质法线链中找到贴图, 工作分辨率回退 2048")
+        return 2048
+    return max(sizes)
+
+
 # ---------------------------------------------------------------------------
 # 直算前端: numpy 材质法线链求值器
 # ---------------------------------------------------------------------------
@@ -887,7 +938,9 @@ def _build_inner(context, obj, s, report, t0):
     source = _resolve_source(obj, s)
     loop_uv = _read_loop_uvs(me)
     loop_vert = _read_loop_verts(me)
-    bake_size = int(s.bake_size)
+    # 工作分辨率 = 实际接入贴图的原生分辨率, 不再由用户猜数字(见 _native_resolution)
+    bake_size = _native_resolution(obj, source, s.image if source == 'IMAGE' else None)
+    print(f"[NormalMapToMesh] 工作分辨率(源贴图原生) = {bake_size}px")
     gx, gy, wmap = _gradients_cached(
         context, obj, me, source, s.image if source == 'IMAGE' else None,
         bake_size, loop_uv, loop_vert, bool(s.force_bake),

@@ -25,12 +25,6 @@ class NMTMSettings(bpy.types.PropertyGroup):
         description="1.0 = 按法线坡度积分出的物理高度(物体空间单位, 高频细节自动"
                     "获得与波长匹配的小高度)。完全平贴严格零位移(无整体膨胀), "
                     "凹凸随倾斜方向正负; 负值整体反向")
-    bake_size: EnumProperty(
-        name="烘焙分辨率",
-        items=(('512', "512", ""), ('1024', "1024", ""),
-               ('2048', "2048", ""), ('4096', "4096", "")),
-        default='2048',
-        description="物体空间法线烘焙图分辨率, 通常取源法线贴图同档")
     edge_smooth_iters: IntProperty(
         name="边缘/位移平滑", default=8, min=0, max=64,
         description="位移向量场的图拉普拉斯平滑迭代次数: 开放边界(卡片边缘)顶点"
@@ -49,7 +43,7 @@ class NMTMSettings(bpy.types.PropertyGroup):
         description="坡度(tanθ)限幅, 压制烘焙噪声/压缩伪影导致的尖刺(0=关)")
     auto_levels: BoolProperty(
         name="自动级别", default=True,
-        description="按烘焙分辨率 × UV 占用率自动匹配 ≈1 四边形/texel")
+        description="按工作分辨率(源贴图原生) × UV 占用率自动匹配 ≈1 四边形/texel")
     levels: IntProperty(
         name="级别", default=6, min=1, max=9,
         description="手动指定 Multires 细分级别")
@@ -84,7 +78,6 @@ class NMTM_PT_panel(bpy.types.Panel):
 
         box = layout.box()
         box.label(text="选项", icon='PREFERENCES')
-        box.prop(s, "bake_size", text="分辨率")
         box.prop(s, "edge_smooth_iters")
         box.prop(s, "deadzone_lsb")
         box.prop(s, "slope_limit")
