@@ -372,9 +372,15 @@ def _bake_triple(context, obj, source, image, bake_size, loop_uv):
         for m in obj.modifiers:
             m.show_render = False
 
+        tb0 = time.perf_counter()
         rgb_detail = _bake_once(context, obj, 'DETAIL', source, image, bake_size)
+        tb1 = time.perf_counter()
         rgb_base = _bake_once(context, obj, 'BASELINE', source, None, bake_size)
+        tb2 = time.perf_counter()
         pos_map = _bake_once(context, obj, 'POSITION', source, None, bake_size)
+        tb3 = time.perf_counter()
+        print(f"[NormalMapToMesh] 烘焙明细: n1 {tb1 - tb0:.1f}s + n0 {tb2 - tb1:.1f}s"
+              f" + P {tb3 - tb2:.1f}s")
     finally:
         for name, vis in saved_hide:
             o = bpy.data.objects.get(name)
@@ -421,6 +427,14 @@ def _eval_simple_coords(context, obj, level):
         tmp_o.select_set(True)
         context.view_layer.objects.active = tmp_o
         mod = tmp_o.modifiers.new("NMTM_simple", 'MULTIRES')
+        # 关键: multires 层数据(MDISPS)存在 Mesh 数据块里, me.copy() 会带过来,
+        # 新建修改器直接认领——必须先清空, 否则"SIMPLE 对照"输出的是旧 CC/位移面,
+        # 边界校正沦为空转(v3.2 的隐性 bug; 重建时甚至会带上上次的真实位移)。
+        if mod.total_levels > 0:
+            mod.levels = 0
+            mod.sculpt_levels = 0
+            bpy.ops.object.multires_higher_levels_delete(modifier=mod.name)
+        # 注意: 不能隐藏状态下 subdivide(细分算子以当前求值面为插值源, 会改变结果字节)
         for _ in range(level):
             bpy.ops.object.multires_subdivide(modifier=mod.name, mode='SIMPLE')
         mod.levels = level
@@ -488,6 +502,34 @@ def build(context, obj, s, report):
     if me.uv_layers.active is None:
         raise RuntimeError("网格没有 UV 层, 法线贴图无从对应")
 
+    # ---- 把无关物体临时摘出视图层求值: 每次 bpy.ops 都触发整场景深度图刷新,
+    #      重型场景(如整只角色的骨骼变形网格)会被每个算子白算一遍——它们不参与
+    #      本管线任何数据(烘焙走 hide_render 独立管理; obj 自己的骨架物体即使
+    #      隐藏也仍作为依赖被求值), 纯环境开销, 结束后全部还原 ----
+    hidden_objs = []
+    for o in context.view_layer.objects:
+        if o.name != obj.name and not o.hide_get():
+            try:
+                o.hide_set(True)
+                hidden_objs.append(o.name)
+            except Exception:
+                pass
+    try:
+        _build_inner(context, obj, s, report, t0)
+    finally:
+        vl_objects = context.view_layer.objects
+        for name in hidden_objs:
+            o = vl_objects.get(name)
+            if o is not None:
+                try:
+                    o.hide_set(False)
+                except Exception:
+                    pass
+
+
+def _build_inner(context, obj, s, report, t0):
+    me = obj.data
+
     source = _resolve_source(obj, s)
     loop_uv = _read_loop_uvs(me)
     loop_vert = _read_loop_verts(me)
@@ -509,6 +551,7 @@ def build(context, obj, s, report):
 
     # ---- Multires 修改器 ----
     mod = _find_multires(obj)
+    pre_mod = mod   # 提前对照细分时若已有旧层, 先按住它的求值(数据不动, 纯环境开销)
     owned = bool(obj.get("nmtm_owned"))
     if mod is not None and mod.total_levels > 0 and not owned:
         raise RuntimeError(
@@ -527,7 +570,25 @@ def build(context, obj, s, report):
     level = max(1, level)
     quads = len(me.loops) * (4 ** (level - 1))
 
+    # ---- CC 边界校正的对照细分提前算(此刻场景还没有任何重型 multires):
+    #      对照细分是 (基面网格, 级别) 的纯函数, 调用时机不影响其输出 ----
+    t_presub = time.perf_counter()
+    coords_simple = None
+    if s.subdiv_mode == 'CATMULL_CLARK':
+        if pre_mod is not None and pre_mod.total_levels > 0:
+            # 重建场景: 旧层还在, 按住其视口求值(数据不动, 纯环境开销)
+            pre_mod.show_viewport = False
+        try:
+            coords_simple = _eval_simple_coords(context, obj, level)
+        finally:
+            if pre_mod is not None and pre_mod.total_levels > 0:
+                pre_mod.show_viewport = True
+        context.view_layer.objects.active = obj
+    t_simple = time.perf_counter()
+
     # ---- 重置到基面再细分(幂等: 重复应用/换强度不叠加) ----
+    # 注意: 不能在修改器隐藏状态下跑 subdivide——细分算子以当前求值面为插值源,
+    # 隐藏会改变 MDISPS 初始化(实测字节级不等), 只能吃下逐级重求值的开销
     if mod.total_levels > 0:
         mod.levels = 0
         mod.sculpt_levels = 0
@@ -551,6 +612,7 @@ def build(context, obj, s, report):
         ev = obj.evaluated_get(dg)
         tmp_me = bpy.data.meshes.new_from_object(
             ev, preserve_all_data_layers=True, depsgraph=dg)
+        t_eval = time.perf_counter()
 
         vcount = len(tmp_me.vertices)
         lv2 = _read_loop_verts(tmp_me)
@@ -576,6 +638,7 @@ def build(context, obj, s, report):
         h_loop = core.detrend_per_island(h_loop, uv2, island_of_loop2, n_islands, 'PLANE')
         h_loop = core.stitch_islands(h_loop, lv2, island_of_loop2, n_islands)
         h_loop *= w_loop   # 无效采样(未烘焙背景)不位移
+        t_np1 = time.perf_counter()
 
         # 沿基准法线位移 × 高度倍数
         h_vert = core.average_loops_to_verts(h_loop, lv2, vcount)
@@ -621,9 +684,9 @@ def build(context, obj, s, report):
         # Catmull-Clark(平滑)细分的边界校正: CC 把开放边界向内收缩, 锁位移锁不住
         # 细分自身的漂移——用同拓扑 SIMPLE 对照细分把边界顶点拉回基面边缘原位,
         # 校正量沿图距离在 K 环内线性衰减, 平滑融入 CC 内部
+        t_np2 = time.perf_counter()
         corr_stat = ""
-        if s.subdiv_mode == 'CATMULL_CLARK' and boundary_verts.size and ecount:
-            coords_simple = _eval_simple_coords(context, obj, level)
+        if coords_simple is not None and boundary_verts.size and ecount:
             if coords_simple.shape[0] != vcount:
                 print(f"[NormalMapToMesh] 警告: SIMPLE 对照细分拓扑不匹配"
                       f"({coords_simple.shape[0]:,} vs {vcount:,}), 跳过边界校正")
@@ -640,6 +703,7 @@ def build(context, obj, s, report):
                 corr_stat = (f" | CC边界校正 max "
                              f"{np.linalg.norm(corr, axis=1).max() * 1000:.2f}‰/{k_rings}环")
 
+        t_ccfix = time.perf_counter()
         co += dvec
         tmp_me.vertices.foreach_set("co", co.ravel())
         tmp_me.update()
@@ -649,6 +713,10 @@ def build(context, obj, s, report):
                      f"p95 {np.percentile(mag, 95) * 1000:.2f} / "
                      f"max {mag.max() * 1000:.2f} (千分之一物体单位)")
         t_displace = time.perf_counter()
+        print(f"[NormalMapToMesh] 位移明细: 对照细分 {t_simple - t_presub:.1f}s"
+              f" + 求值拷贝 {t_eval - t_subdiv:.1f}s"
+              f" + 采样/岛处理 {t_np1 - t_eval:.1f}s + 锁边/平滑 {t_np2 - t_np1:.1f}s"
+              f" + CC校正 {t_ccfix - t_np2:.1f}s + 写坐标 {t_displace - t_ccfix:.1f}s")
 
         # ---- reshape 写回 Multires 位移层 ----
         tmp_obj = bpy.data.objects.new("NMTM_reshape_tmp", tmp_me)

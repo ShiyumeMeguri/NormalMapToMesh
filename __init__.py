@@ -2,7 +2,7 @@
 bl_info = {
     "name": "Normal Map To Mesh (法线→多级精度高模)",
     "author": "Ruri",
-    "version": (3, 2, 0),
+    "version": (3, 3, 0),
     "blender": (4, 2, 0),
     "location": "3D视图 > 侧栏(N) > Ruri",
     "description": "法线贴图 → Multires 高模: Cycles EMIT 三图烘焙(扰动法线/基准法线/位置)"
