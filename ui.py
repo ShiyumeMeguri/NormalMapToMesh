@@ -36,6 +36,10 @@ class NMTMSettings(bpy.types.PropertyGroup):
         description="位移向量场的图拉普拉斯平滑迭代次数: 开放边界(卡片边缘)顶点"
                     "始终锁死为零位移(防边缘错位撕缝), 平滑让位移向边缘平滑衰减"
                     "并去除高频斑点; 0=只锁边不平滑")
+    force_bake: BoolProperty(
+        name="强制烘焙路径", default=False,
+        description="跳过直算前端, 强制走 Cycles EMIT 烘焙(兼容任意材质节点网络; "
+                    "默认关——直算不支持的节点会自动回退烘焙)")
     subdiv_mode: EnumProperty(
         name="细分方式",
         items=(('SIMPLE', "Simple (保形)", "保持低模形状, 细节与烘焙面完全对位"),
@@ -90,6 +94,7 @@ class NMTM_PT_panel(bpy.types.Panel):
         sub.active = not s.auto_levels
         sub.prop(s, "levels", text="")
         box.prop(s, "quad_budget")
+        box.prop(s, "force_bake")
 
         if obj is not None and obj.get("nmtm_owned"):
             box = layout.box()

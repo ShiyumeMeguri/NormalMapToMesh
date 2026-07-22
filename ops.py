@@ -1,20 +1,21 @@
 # -*- coding: utf-8 -*-
-# NormalMapToMesh 操作层 —— bpy 侧: Cycles 物体空间法线烘焙、Multires 管理、
-# depsgraph 求值、numpy 向量位移、multires_reshape 写回。
+# NormalMapToMesh 操作层 —— bpy 侧: 直算前端(免烘焙)、Multires 管理、
+# Subsurf 统一细分求值、numpy 位移、multires_reshape 写回。
 #
-# 流程(一键):
-#   1. 用 Cycles EMIT 烘焙三张物体空间图(按指纹缓存): 带法线贴图的扰动法线 n1
-#      (材质 Normal Map 节点输出 / 所选贴图临时链)、纯平滑基准法线 n0
-#      (Geometry.Normal)、表面位置 P(Geometry.Position, 原始浮点)。
-#      切线基/绿通道约定/通道重建/镜像 UV 岛全部由渲染器按材质真实节点求值。
-#   2. 零猜测装配高度梯度 dh/du = (n0 − n1/(n1·n0))·∂P/∂u → FC 频域泊松积分
-#      → 物理高度场(物体单位); 平贴处梯度严格 0 → 高度 0, 无整体膨胀。
-#   3. 自动算细分级别 → 建/重置 Multires → SIMPLE 细分 L 级(保形)。
-#   4. 关其它修改器 → depsgraph 求值细分基面 → 逐 loop 采样高度 → 逐岛去趋势
-#      → 岛间缝合 → 逐顶点平均 → 沿基准法线位移 × 高度倍数。
-#   5. 临时物体 + multires_reshape 把绝对坐标写回 Multires 位移层 → 清理。
+# v4 架构(默认全程免 Cycles):
+#   1. 直算前端: mikktspace 切线帧(calc_tangents, 与渲染器同源)+逐三角形解析
+#      ∂P/∂u,∂P/∂v 光栅化到 UV 网格; 材质法线链用 numpy 节点求值器直接算
+#      (游戏导入材质的通道重建网络节点种类有限), 切线空间法线图 + 切线帧
+#      → 高度梯度。不支持的节点/网格自动回退 v3 的 Cycles EMIT 三图烘焙。
+#   2. FC 频域泊松积分 → 物理高度场(平贴严格 0)。
+#   3. Multires 建层只为数据结构(隐藏态跑 subdivide, 免逐级重求值;
+#      reshape 会完整覆写 MDISPS); 重建时层数匹配则整段跳过。
+#   4. 细分基面统一用 Subsurf 求值副本(拓扑与 multires 逐位一致, 实测):
+#      免去 1M 顶点 multires 求值, 也让"重建"不再需要删层重细分。
+#   5. 采样高度 → 逐岛去趋势/缝合 → 边缘锁定/位移平滑 → CC 边界校正
+#      (SIMPLE 对照 = Subsurf 线性细分, 即精确解) → multires_reshape 写回。
 #
-# 重复点"应用"= 从基面重建(幂等), 改倍数即所见即所得。
+# 重复点"应用"= 从基面重建(幂等), 改倍数即所见即所得(全缓存命中, 只剩写回)。
 
 import time
 
@@ -26,13 +27,12 @@ from . import core
 
 MAX_LEVELS = 9
 BAKE_MARGIN = 16
-BAKE_SAMPLES = 1   # EMIT 烘焙无噪声, 1 采样足够
+BAKE_SAMPLES = 1   # EMIT 烘焙无噪声, 1 采样足够(回退路径)
 
-# 运行期缓存: (网格指纹, 材质, 来源, 分辨率) -> 三张烘焙图 (n1, n0, P)。
-# 注意只认网格/材质"身份", 不追踪材质节点内容变化——本会话内改了材质请重开会话
-# 或换烘焙分辨率强制失效。
-_bake_cache = {}
+# 运行期缓存(只认网格/材质"身份", 不追踪材质节点内容变化)
+_grad_cache = {}     # 前端结果: (gx, gy, wmap, n0_enc)
 _island_cache = {}
+_simple_cache = {}   # SIMPLE 对照细分坐标
 
 
 def _cache_put(cache, key, val, cap=2):
@@ -43,7 +43,7 @@ def _cache_put(cache, key, val, cap=2):
 
 
 def clear_caches():
-    _bake_cache.clear()
+    _grad_cache.clear()
     _island_cache.clear()
     _simple_cache.clear()
 
@@ -122,7 +122,7 @@ def _resolve_source(obj, s):
     """返回 'MATERIAL' 或 'IMAGE'。AUTO 优先材质自带法线链(最忠实, 含通道重建网络)。"""
     if s.source == 'MATERIAL':
         if not _has_material_normal_chain(obj):
-            raise RuntimeError("物体材质里没有 Normal Map 节点, 无法按材质烘焙; 请改用贴图模式")
+            raise RuntimeError("物体材质里没有 Normal Map 节点, 无法按材质求值; 请改用贴图模式")
         return 'MATERIAL'
     if s.source == 'IMAGE':
         if s.image is None:
@@ -136,7 +136,221 @@ def _resolve_source(obj, s):
 
 
 # ---------------------------------------------------------------------------
-# Cycles 物体空间法线烘焙
+# 直算前端: numpy 材质法线链求值器
+# ---------------------------------------------------------------------------
+
+class _NodeEvalUnsupported(Exception):
+    """材质网络含求值器不支持的节点/接法 → 整体回退 Cycles 烘焙路径。"""
+
+
+def _read_image_grid(img, size):
+    """图像重采样到 (size, size, 4): 与烘焙语义一致——网格 texel 中心做双线性。
+    分辨率恰好相同时为逐位直读。"""
+    if img is None:
+        raise _NodeEvalUnsupported("图像节点没有图像")
+    w, h = img.size
+    if w == 0 or h == 0:
+        raise RuntimeError(f"贴图 '{img.name}' 没有像素数据(文件缺失?)")
+    ch = img.channels
+    buf = np.empty(w * h * ch, np.float32)
+    img.pixels.foreach_get(buf)
+    px = buf.reshape(h, w, ch)
+    if ch < 4:
+        rgba = np.ones((h, w, 4), np.float32)
+        rgba[..., :ch] = px
+        px = rgba
+    if (w, h) == (size, size):
+        return px[..., :4]
+    uu = ((np.arange(size) + 0.5) / size).astype(np.float32)
+    grid_u = np.broadcast_to(uu[None, :], (size, size)).ravel()
+    grid_v = np.broadcast_to(uu[:, None], (size, size)).ravel()
+    out = core.sample_bilinear_wrap(px[..., :4], grid_u, grid_v)
+    return out.reshape(size, size, 4).astype(np.float32)
+
+
+def _as_scalar(x, size):
+    if isinstance(x, np.ndarray):
+        if x.ndim == 3:
+            # 颜色隐转标量: 取平均(Blender 隐转是亮度, 法线链里几乎不出现——保守拒绝)
+            raise _NodeEvalUnsupported("颜色→标量隐式转换")
+        return x
+    return float(x)
+
+
+def _as_vec3(x, size):
+    if isinstance(x, np.ndarray):
+        if x.ndim == 2:
+            return np.repeat(x[..., None], 3, axis=2)
+        return x[..., :3]
+    if isinstance(x, (int, float)):
+        return np.full((size, size, 3), float(x), np.float32)
+    v = np.asarray(x, np.float32)[:3]
+    return np.broadcast_to(v, (size, size, 3)).copy()
+
+
+def _eval_socket(socket, size, memo):
+    """递归求值输出 socket → float / (S,S) / (S,S,3)。不支持 → _NodeEvalUnsupported。"""
+    key = (socket.node.name, socket.identifier)
+    if key in memo:
+        return memo[key]
+    node = socket.node
+    nt = node.type
+
+    def inp(i):
+        sk = node.inputs[i]
+        if sk.is_linked:
+            return _eval_socket(sk.links[0].from_socket, size, memo)
+        dv = sk.default_value
+        try:
+            return float(dv)
+        except TypeError:
+            return tuple(dv)[:3]
+
+    if nt == 'REROUTE':
+        val = _eval_socket(node.inputs[0].links[0].from_socket, size, memo) \
+            if node.inputs[0].is_linked else 0.0
+    elif nt == 'TEX_IMAGE':
+        if node.inputs['Vector'].is_linked:
+            raise _NodeEvalUnsupported("图像节点带自定义 Vector 输入")
+        rgba = _read_image_grid(node.image, size)
+        if socket.name == 'Alpha':
+            val = rgba[..., 3].copy()
+        else:
+            val = rgba[..., :3].copy()
+    elif nt in ('SEPARATE_COLOR', 'SEPRGB', 'SEPARATE_XYZ', 'SEPXYZ'):
+        if nt == 'SEPARATE_COLOR' and getattr(node, 'mode', 'RGB') != 'RGB':
+            raise _NodeEvalUnsupported(f"Separate Color 模式 {node.mode}")
+        vec = _as_vec3(inp(0), size)
+        idx = {'Red': 0, 'Green': 1, 'Blue': 2, 'X': 0, 'Y': 1, 'Z': 2}[socket.name]
+        val = vec[..., idx].copy()
+    elif nt in ('COMBINE_COLOR', 'COMBRGB', 'COMBINE_XYZ', 'COMBXYZ'):
+        if nt == 'COMBINE_COLOR' and getattr(node, 'mode', 'RGB') != 'RGB':
+            raise _NodeEvalUnsupported(f"Combine Color 模式 {node.mode}")
+        parts = [_as_scalar(inp(i), size) for i in range(3)]
+        if all(isinstance(p, float) for p in parts):
+            val = tuple(parts)
+        else:
+            parts = [p if isinstance(p, np.ndarray)
+                     else np.full((size, size), p, np.float32) for p in parts]
+            val = np.stack(parts, axis=-1).astype(np.float32)
+    elif nt == 'MATH':
+        op = node.operation
+        a = _as_scalar(inp(0), size)
+        b = _as_scalar(inp(1), size) if len(node.inputs) > 1 else 0.0
+        if op == 'ADD':
+            val = a + b
+        elif op == 'SUBTRACT':
+            val = a - b
+        elif op == 'MULTIPLY':
+            val = a * b
+        elif op == 'DIVIDE':
+            val = a / np.maximum(np.abs(b), 1e-20) * np.sign(b) if isinstance(b, np.ndarray) \
+                else (a / b if b != 0.0 else a * 0.0)
+        elif op == 'MULTIPLY_ADD':
+            val = a * b + _as_scalar(inp(2), size)
+        elif op == 'POWER':
+            val = np.power(np.maximum(a, 0.0), b) if isinstance(a, np.ndarray) else a ** b
+        elif op == 'SQRT':
+            val = np.sqrt(np.maximum(a, 0.0))
+        elif op == 'ABSOLUTE':
+            val = np.abs(a)
+        elif op == 'MINIMUM':
+            val = np.minimum(a, b)
+        elif op == 'MAXIMUM':
+            val = np.maximum(a, b)
+        elif op == 'FLOOR':
+            val = np.floor(a)
+        elif op == 'ROUND':
+            val = np.round(a)
+        elif op == 'FRACT':
+            val = a - np.floor(a)
+        else:
+            raise _NodeEvalUnsupported(f"Math 运算 {op}")
+        if node.use_clamp:
+            val = np.clip(val, 0.0, 1.0)
+    elif nt == 'VECT_MATH':
+        op = node.operation
+        a = _as_vec3(inp(0), size)
+        b = _as_vec3(inp(1), size) if len(node.inputs) > 1 else None
+        if op == 'ADD':
+            val = a + b
+        elif op == 'SUBTRACT':
+            val = a - b
+        elif op == 'MULTIPLY':
+            val = a * b
+        elif op == 'DIVIDE':
+            val = a / np.where(np.abs(b) < 1e-20, 1.0, b)
+        elif op == 'MULTIPLY_ADD':
+            val = a * b + _as_vec3(inp(2), size)
+        elif op == 'SCALE':
+            sc = node.inputs['Scale']
+            scv = _eval_socket(sc.links[0].from_socket, size, memo) if sc.is_linked \
+                else float(sc.default_value)
+            val = a * (scv[..., None] if isinstance(scv, np.ndarray) else scv)
+        elif op == 'NORMALIZE':
+            ln = np.linalg.norm(a, axis=-1, keepdims=True)
+            val = a / np.maximum(ln, 1e-20)
+        elif op == 'DOT_PRODUCT':
+            val = np.einsum('...i,...i->...', a, b).astype(np.float32)
+        elif op == 'CROSS_PRODUCT':
+            val = np.cross(a, b).astype(np.float32)
+        elif op == 'LENGTH':
+            val = np.linalg.norm(a, axis=-1).astype(np.float32)
+        else:
+            raise _NodeEvalUnsupported(f"Vector Math 运算 {op}")
+        if isinstance(val, np.ndarray) and socket.name == 'Value' and val.ndim == 3:
+            raise _NodeEvalUnsupported(f"Vector Math {op} 的 Value 输出")
+    elif nt == 'VALUE':
+        val = float(node.outputs[0].default_value)
+    elif nt == 'RGB':
+        val = tuple(node.outputs[0].default_value)[:3]
+    elif nt == 'GAMMA':
+        a = _as_vec3(inp(0), size)
+        g = _as_scalar(inp(1), size)
+        val = np.power(np.maximum(a, 0.0), g)
+    elif nt == 'INVERT':
+        fac = _as_scalar(inp(0), size)
+        col = _as_vec3(inp(1), size)
+        val = col + (1.0 - 2.0 * col) * (fac[..., None] if isinstance(fac, np.ndarray) else fac)
+    else:
+        raise _NodeEvalUnsupported(f"节点类型 {nt}")
+    memo[key] = val
+    return val
+
+
+def _eval_material_tangent_map(mat, size):
+    """numpy 求值材质法线链 → (S,S,3) 切线空间法线(已解码, 含 Strength)。
+
+    取第一个 Normal Map 节点的 Color 输入上游网络求值, t = 2c−1;
+    Strength ≠ 1 时 t' = (0,0,1)(1−s) + t·s (Normal Map 节点的线性混合语义)。
+    无 Normal Map 节点 → None(平坦)。
+    """
+    nt_tree = mat.node_tree
+    nmaps = [n for n in nt_tree.nodes if n.type == 'NORMAL_MAP']
+    if not nmaps:
+        return None
+    if len(nmaps) > 1:
+        print(f"[NormalMapToMesh] 警告: 材质 '{mat.name}' 有 {len(nmaps)} 个 Normal Map, 取第一个")
+    nmap = nmaps[0]
+    if nmap.space != 'TANGENT':
+        raise _NodeEvalUnsupported(f"Normal Map 空间 {nmap.space}")
+    if nmap.inputs['Strength'].is_linked:
+        raise _NodeEvalUnsupported("Normal Map Strength 被连线")
+    strength = float(nmap.inputs['Strength'].default_value)
+    csock = nmap.inputs['Color']
+    if not csock.is_linked:
+        col = np.broadcast_to(np.array([0.5, 0.5, 1.0], np.float32), (size, size, 3)).copy()
+    else:
+        col = _as_vec3(_eval_socket(csock.links[0].from_socket, size, {}), size)
+    t = col.astype(np.float32) * 2.0 - 1.0
+    if strength != 1.0:
+        flat = np.array([0.0, 0.0, 1.0], np.float32)
+        t = flat * (1.0 - strength) + t * strength
+    return t
+
+
+# ---------------------------------------------------------------------------
+# 直算前端: 切线帧光栅化 + 梯度
 # ---------------------------------------------------------------------------
 
 def _mesh_fingerprint(me, loop_uv):
@@ -144,12 +358,128 @@ def _mesh_fingerprint(me, loop_uv):
     return (me.name_full, len(me.vertices), len(me.polygons), len(me.loops), fp)
 
 
-def _build_encoder(nt, src_socket, vector_type='NORMAL', encode=True):
-    """向量(世界空间) → Vector Transform 转物体空间 → (可选 ×0.5+0.5 编码) → Emission。
+def _gradients_direct(obj, me, source, image, size, loop_uv, loop_vert):
+    """免烘焙直算: mikktspace 切线帧 + 逐三角形解析 ∂P → UV 高度梯度。
 
-    法线用 NORMAL 类型+编码; 位置用 POINT 类型+原始浮点(float 图保 HDR)。
-    返回 (新建节点列表, emission 节点)。调用方负责把 emission 接到材质输出并清理。
+    与烘焙路径同一代数; 镜像/混合手性由逐 loop bitangent_sign 精确携带,
+    解析 ∂P 消灭了位置图有限差分与岛间沟槽问题。
+    返回 (gx, gy, wmap, n0_enc[编码基准法线网格, 与烘焙 rgb_base 同构消费])。
     """
+    uv_name = me.uv_layers.active.name
+    try:
+        me.calc_tangents(uvmap=uv_name)
+    except RuntimeError as e:
+        raise _NodeEvalUnsupported(f"calc_tangents 失败(网格含五边以上面?): {e}")
+    n_l = len(me.loops)
+    tan = np.empty(n_l * 3, np.float32)
+    me.loops.foreach_get("tangent", tan)
+    tan = tan.reshape(-1, 3)
+    sign = np.empty(n_l, np.float32)
+    me.loops.foreach_get("bitangent_sign", sign)
+    nrm = np.empty(n_l * 3, np.float32)
+    me.corner_normals.foreach_get("vector", nrm)
+    nrm = nrm.reshape(-1, 3)
+    me.free_tangents()
+
+    pos = _read_vert_cos(me)
+    me.calc_loop_triangles()
+    t_count = len(me.loop_triangles)
+    tl = np.empty(t_count * 3, np.int32)
+    me.loop_triangles.foreach_get("loops", tl)
+    tl = tl.reshape(-1, 3)
+    tp = np.empty(t_count, np.int32)
+    me.loop_triangles.foreach_get("polygon_index", tp)
+    pmat = np.empty(len(me.polygons), np.int32)
+    me.polygons.foreach_get("material_index", pmat)
+
+    tri_uv = loop_uv[tl.ravel()].reshape(-1, 3, 2)
+    tri_pos = pos[loop_vert[tl.ravel()]].reshape(-1, 3, 3)
+    d1 = (tri_uv[:, 1] - tri_uv[:, 0]).astype(np.float64)
+    d2 = (tri_uv[:, 2] - tri_uv[:, 0]).astype(np.float64)
+    e1 = (tri_pos[:, 1] - tri_pos[:, 0]).astype(np.float64)
+    e2 = (tri_pos[:, 2] - tri_pos[:, 0]).astype(np.float64)
+    det = d1[:, 0] * d2[:, 1] - d1[:, 1] * d2[:, 0]
+    valid = np.abs(det) > 1e-16
+    det_safe = np.where(valid, det, 1.0)
+    pu = (e1 * d2[:, 1, None] - e2 * d1[:, 1, None]) / det_safe[:, None]
+    pv = (e2 * d1[:, 0, None] - e1 * d2[:, 0, None]) / det_safe[:, None]
+
+    # 逐角属性: T(3) N(3) sign(1) + 逐三角形常量 Pu(3) Pv(3) mat(1) = C14
+    attrs = np.empty((t_count, 3, 14), np.float32)
+    attrs[:, :, 0:3] = tan[tl.ravel()].reshape(-1, 3, 3)
+    attrs[:, :, 3:6] = nrm[tl.ravel()].reshape(-1, 3, 3)
+    attrs[:, :, 6] = sign[tl.ravel()].reshape(-1, 3)
+    attrs[:, :, 7:10] = pu.astype(np.float32)[:, None, :]
+    attrs[:, :, 10:13] = pv.astype(np.float32)[:, None, :]
+    attrs[:, :, 13] = pmat[tp].astype(np.float32)[:, None]
+
+    grid, mask0 = core.rasterize_tris(tri_uv[valid], attrs[valid], size)
+
+    # 切线空间法线图
+    if source == 'IMAGE':
+        t_map = _read_image_grid(image, size)[..., :3] * 2.0 - 1.0
+    else:
+        flat = np.broadcast_to(np.array([0.0, 0.0, 1.0], np.float32), (size, size, 3))
+        mat_maps = []
+        for slot in obj.material_slots:
+            m = slot.material
+            t = _eval_material_tangent_map(m, size) if m is not None else None
+            mat_maps.append(flat if t is None else t)
+        if not mat_maps:
+            mat_maps = [flat]
+        if len(mat_maps) == 1:
+            t_map = np.ascontiguousarray(mat_maps[0])
+        else:
+            # 多材质槽: 光栅化的逐 texel 材质号选择对应贴图链结果
+            mi = np.clip(np.round(grid[..., 13]).astype(np.int64), 0, len(mat_maps) - 1)
+            t_map = np.empty((size, size, 3), np.float32)
+            for i, m in enumerate(mat_maps):
+                sel = mi == i
+                t_map[sel] = m[sel]
+
+    # 梯度只取真实 UV 覆盖区(mask0): 外扩 margin 的复制内容会虚增积分能量
+    gx, gy, _ = core.gradients_from_tangent_frames(
+        t_map, grid[..., 0:3], grid[..., 3:6], grid[..., 6],
+        grid[..., 7:10], grid[..., 10:13], mask0)
+
+    # 采样连续性只需要法线通道外扩(岛边界 bilinear 不吃到无效 texel)
+    n0grid, mask1 = core.dilate_grid(grid[..., 3:6], mask0, BAKE_MARGIN)
+    ln = np.linalg.norm(n0grid, axis=-1, keepdims=True)
+    n0_enc = (n0grid / np.maximum(ln, 1e-12) + 1.0) * 0.5
+    n0_enc[~mask1] = 0.0   # 未覆盖 texel 编码为无效(解码长度 1.73 → 权重 0)
+    wmap = mask1.astype(np.float32)
+    return gx, gy, wmap, n0_enc.astype(np.float32)
+
+
+def _gradients_cached(context, obj, me, source, image, size, loop_uv, loop_vert, force_bake):
+    mats = tuple(s.material.name_full if s.material else '' for s in obj.material_slots)
+    key = (_mesh_fingerprint(me, loop_uv), mats, source,
+           image.name_full if image is not None else '', int(size), bool(force_bake))
+    got = _grad_cache.get(key)
+    if got is not None:
+        return got
+
+    result = None
+    if not force_bake:
+        try:
+            result = _gradients_direct(obj, me, source, image, size, loop_uv, loop_vert)
+            print("[NormalMapToMesh] 前端: 直算(免烘焙)")
+        except _NodeEvalUnsupported as e:
+            print(f"[NormalMapToMesh] 直算不支持({e}), 回退 Cycles 烘焙")
+    if result is None:
+        rgb_detail, rgb_base, pos_map = _bake_triple(context, obj, source, image, size, loop_uv)
+        gx, gy, wmap = core.height_gradients(rgb_detail, rgb_base, pos_map)
+        result = (gx, gy, wmap, rgb_base)
+    _cache_put(_grad_cache, key, result)
+    return result
+
+
+# ---------------------------------------------------------------------------
+# 回退路径: Cycles EMIT 三图烘焙 (v3 原样保留)
+# ---------------------------------------------------------------------------
+
+def _build_encoder(nt, src_socket, vector_type='NORMAL', encode=True):
+    """向量(世界空间) → Vector Transform 转物体空间 → (可选 ×0.5+0.5 编码) → Emission。"""
     vt = nt.nodes.new('ShaderNodeVectorTransform')
     vt.vector_type = vector_type
     vt.convert_from = 'WORLD'
@@ -172,24 +502,14 @@ def _build_encoder(nt, src_socket, vector_type='NORMAL', encode=True):
 
 
 def _bake_once(context, obj, kind, source, image, bake_size):
-    """单次物体空间 EMIT 烘焙 → (H, W, 3) float32。
-
-    Blender 5.x 的 Cycles NORMAL 烘焙只输出几何平滑法线, **不含**材质法线贴图
-    扰动(实测两图逐位相同), 因此用 EMIT 发射色编码烘出所需向量。
-    kind='DETAIL': 扰动法线 n1——MATERIAL 来源把每个材质的 Normal Map 节点输出
-                   临时接进编码链(无 Normal Map 的材质接 Geometry.Normal → 零梯度);
-                   IMAGE 来源用所选贴图临时搭 TexImage→NormalMap→编码链。
-    kind='BASELINE': 基准法线 n0——全部槽临时换 Geometry.Normal 编码链。
-    kind='POSITION': 表面位置 P——全部槽临时换 Geometry.Position 原始浮点链。
-    场景/选中/隐藏/修改器状态由 _bake_triple 负责; 本函数管材质/节点/目标图, 结束全还原。
-    """
+    """单次物体空间 EMIT 烘焙 → (H, W, 3) float32。(回退路径)"""
     me = obj.data
     bake_img = None
     tmp_mat = None
     saved_slots = None
     slot_appended = False
-    inserted = []   # (材质名, 烘焙目标节点名, 原active节点名)
-    grafts = []     # (材质名, [临时节点名], 输出节点名, (原surface来源节点名, 输出口名)|None)
+    inserted = []
+    grafts = []
     try:
         bake_img = bpy.data.images.new(f"NMTM_bake_{kind}", width=bake_size,
                                        height=bake_size, float_buffer=True)
@@ -322,26 +642,13 @@ def _bake_once(context, obj, kind, source, image, bake_size):
 
 
 def _bake_triple(context, obj, source, image, bake_size, loop_uv):
-    """三次同参数物体空间 EMIT 烘焙(n1, n0, P) → 三张 (H,W,3)。按指纹缓存。
-
-    烘焙期间临时: 切 Cycles(CPU)、隐藏其它物体、关掉本物体全部修改器的渲染求值
-    (烘出静息态基面数据, 与写进 Multires 的位移空间一致)。结束后全部还原。
-    """
-    me = obj.data
-    mats = tuple(s.material.name_full if s.material else '' for s in obj.material_slots)
-    key = (_mesh_fingerprint(me, loop_uv), mats, source,
-           image.name_full if image is not None else '', int(bake_size))
-    got = _bake_cache.get(key)
-    if got is not None:
-        return got
-
+    """三次同参数物体空间 EMIT 烘焙(n1, n0, P)。(回退路径, 无缓存——由上层缓存)"""
     if source == 'MATERIAL':
         for slot in obj.material_slots:
             if slot.material is not None and slot.material.library is not None:
                 raise RuntimeError(
                     f"材质 '{slot.material.name}' 来自链接库, 无法插入烘焙节点; 请先 Make Local")
     if source == 'IMAGE':
-        # 法线贴图按惯例应为 Non-Color(仅文件图: 改生成型图的色彩空间会清掉像素)
         try:
             if image.source == 'FILE' and image.colorspace_settings.name != 'Non-Color':
                 image.colorspace_settings.name = 'Non-Color'
@@ -351,7 +658,7 @@ def _bake_triple(context, obj, source, image, bake_size, loop_uv):
     scene = context.scene
     saved_scene = (scene.render.engine, scene.cycles.device, scene.cycles.samples,
                    scene.cycles.bake_type, scene.render.bake.use_selected_to_active,
-                   scene.render.bake.margin, scene.render.bake.normal_space)
+                   scene.render.bake.margin)
     saved_hide = [(o.name, o.hide_render) for o in bpy.data.objects]
     saved_show_render = [(m.name, m.show_render) for m in obj.modifiers]
     try:
@@ -372,15 +679,9 @@ def _bake_triple(context, obj, source, image, bake_size, loop_uv):
         for m in obj.modifiers:
             m.show_render = False
 
-        tb0 = time.perf_counter()
         rgb_detail = _bake_once(context, obj, 'DETAIL', source, image, bake_size)
-        tb1 = time.perf_counter()
         rgb_base = _bake_once(context, obj, 'BASELINE', source, None, bake_size)
-        tb2 = time.perf_counter()
         pos_map = _bake_once(context, obj, 'POSITION', source, None, bake_size)
-        tb3 = time.perf_counter()
-        print(f"[NormalMapToMesh] 烘焙明细: n1 {tb1 - tb0:.1f}s + n0 {tb2 - tb1:.1f}s"
-              f" + P {tb3 - tb2:.1f}s")
     finally:
         for name, vis in saved_hide:
             o = bpy.data.objects.get(name)
@@ -392,66 +693,56 @@ def _bake_triple(context, obj, source, image, bake_size, loop_uv):
                 m.show_render = vis
         (scene.render.engine, scene.cycles.device, scene.cycles.samples,
          scene.cycles.bake_type, scene.render.bake.use_selected_to_active,
-         scene.render.bake.margin, scene.render.bake.normal_space) = saved_scene
+         scene.render.bake.margin) = saved_scene
 
-    triple = (rgb_detail, rgb_base, pos_map)
-    _cache_put(_bake_cache, key, triple)
-    return triple
+    return rgb_detail, rgb_base, pos_map
 
 
-_simple_cache = {}
+# ---------------------------------------------------------------------------
+# Subsurf 统一细分求值(拓扑与 multires 逐位一致, 实测)
+# ---------------------------------------------------------------------------
+
+def _subsurf_eval_mesh(context, obj, level, sub_type, uv_smooth):
+    """网格副本 + Subsurf 求值 → 新 Mesh 数据块(调用方负责删除)。
+
+    无算子、无选择/撤销依赖, 也天然不受 Mesh 里已有 MDISPS 影响(Subsurf 忽略之)。
+    拓扑/顶点序与 multires 求值逐位一致(实测); SIMPLE+uv_smooth=NONE 即精确线性细分。
+    """
+    me2 = obj.data.copy()
+    tmp_o = bpy.data.objects.new("NMTM_subd_tmp", me2)
+    context.scene.collection.objects.link(tmp_o)
+    try:
+        mod = tmp_o.modifiers.new("NMTM_subd", 'SUBSURF')
+        mod.subdivision_type = sub_type
+        mod.levels = level
+        mod.render_levels = level
+        mod.quality = 4                  # multires 默认
+        mod.uv_smooth = uv_smooth
+        mod.boundary_smooth = 'ALL'
+        dg = context.evaluated_depsgraph_get()
+        out = bpy.data.meshes.new_from_object(tmp_o.evaluated_get(dg),
+                                              preserve_all_data_layers=True, depsgraph=dg)
+    finally:
+        bpy.data.objects.remove(tmp_o, do_unlink=True)
+        try:
+            bpy.data.meshes.remove(me2)
+        except Exception:
+            pass
+    return out
 
 
 def _eval_simple_coords(context, obj, level):
-    """在网格副本上做同级 SIMPLE 多级细分求值 → 顶点坐标 (V,3)。按指纹缓存。
-
-    Catmull-Clark(平滑)细分会把开放边界向内收缩——锁位移锁不住细分自身的漂移。
-    SIMPLE 细分与 CC 细分的拓扑/顶点序完全一致(同一均匀细化, 模式只影响坐标),
-    其边界顶点恰好留在基面边缘原位, 用作边界校正的目标位置。
-    副本不带任何其它修改器(与主求值隐藏 Armature 的口径一致)。
-    """
+    """同级 SIMPLE(线性)细分坐标 (V,3) —— CC 边界校正的目标位置。按指纹缓存。"""
     me = obj.data
     key = (me.name_full, len(me.vertices), len(me.loops), int(level), 'simple')
     got = _simple_cache.get(key)
     if got is not None:
         return got
-
-    tmp_o = None
-    me2 = None
+    tm = _subsurf_eval_mesh(context, obj, level, 'SIMPLE', 'NONE')
     try:
-        me2 = me.copy()
-        tmp_o = bpy.data.objects.new("NMTM_simple_tmp", me2)
-        context.scene.collection.objects.link(tmp_o)
-        for o in list(context.selected_objects):
-            o.select_set(False)
-        tmp_o.select_set(True)
-        context.view_layer.objects.active = tmp_o
-        mod = tmp_o.modifiers.new("NMTM_simple", 'MULTIRES')
-        # 关键: multires 层数据(MDISPS)存在 Mesh 数据块里, me.copy() 会带过来,
-        # 新建修改器直接认领——必须先清空, 否则"SIMPLE 对照"输出的是旧 CC/位移面,
-        # 边界校正沦为空转(v3.2 的隐性 bug; 重建时甚至会带上上次的真实位移)。
-        if mod.total_levels > 0:
-            mod.levels = 0
-            mod.sculpt_levels = 0
-            bpy.ops.object.multires_higher_levels_delete(modifier=mod.name)
-        # 注意: 不能隐藏状态下 subdivide(细分算子以当前求值面为插值源, 会改变结果字节)
-        for _ in range(level):
-            bpy.ops.object.multires_subdivide(modifier=mod.name, mode='SIMPLE')
-        mod.levels = level
-        dg = context.evaluated_depsgraph_get()
-        ev_me = tmp_o.evaluated_get(dg).data
-        n = len(ev_me.vertices)
-        buf = np.empty(n * 3, np.float32)
-        ev_me.vertices.foreach_get("co", buf)
-        coords = buf.reshape(-1, 3).copy()
+        coords = _read_vert_cos(tm).copy()
     finally:
-        if tmp_o is not None:
-            bpy.data.objects.remove(tmp_o, do_unlink=True)
-        if me2 is not None:
-            try:
-                bpy.data.meshes.remove(me2)
-            except Exception:
-                pass
+        bpy.data.meshes.remove(tm)
     _cache_put(_simple_cache, key, coords)
     return coords
 
@@ -503,9 +794,7 @@ def build(context, obj, s, report):
         raise RuntimeError("网格没有 UV 层, 法线贴图无从对应")
 
     # ---- 把无关物体临时摘出视图层求值: 每次 bpy.ops 都触发整场景深度图刷新,
-    #      重型场景(如整只角色的骨骼变形网格)会被每个算子白算一遍——它们不参与
-    #      本管线任何数据(烘焙走 hide_render 独立管理; obj 自己的骨架物体即使
-    #      隐藏也仍作为依赖被求值), 纯环境开销, 结束后全部还原 ----
+    #      重型场景(如整只角色的骨骼变形网格)会被每个算子白算一遍 ----
     hidden_objs = []
     for o in context.view_layer.objects:
         if o.name != obj.name and not o.hide_get():
@@ -534,24 +823,21 @@ def _build_inner(context, obj, s, report, t0):
     loop_uv = _read_loop_uvs(me)
     loop_vert = _read_loop_verts(me)
     bake_size = int(s.bake_size)
-    rgb_detail, rgb_base, pos_map = _bake_triple(context, obj, source,
-                                                 s.image if source == 'IMAGE' else None,
-                                                 bake_size, loop_uv)
+    gx, gy, wmap, n0_enc = _gradients_cached(
+        context, obj, me, source, s.image if source == 'IMAGE' else None,
+        bake_size, loop_uv, loop_vert, bool(s.force_bake))
 
-    # 零猜测高度重建: 梯度 = (n0 − n1/(n1·n0))·∂P/∂{u,v} → 频域泊松积分(物理单位)
-    gx, gy, wmap = core.height_gradients(rgb_detail, rgb_base, pos_map)
     field = core.integrate_height(gx, gy)
     if not (wmap > 0).any():
-        raise RuntimeError("烘焙图全部无效(法线长度异常), 高度重建失败")
+        raise RuntimeError("梯度全部无效(UV 未覆盖/法线异常), 高度重建失败")
     print(f"[NormalMapToMesh] 梯度有效率 {wmap.mean():.1%} | "
           f"高度场 p95 {np.percentile(np.abs(field[wmap > 0]), 95) * 1000:.2f}‰")
-    t_bake = time.perf_counter()
+    t_front = time.perf_counter()
 
     fill = _uv_fill(me, loop_uv)
 
     # ---- Multires 修改器 ----
     mod = _find_multires(obj)
-    pre_mod = mod   # 提前对照细分时若已有旧层, 先按住它的求值(数据不动, 纯环境开销)
     owned = bool(obj.get("nmtm_owned"))
     if mod is not None and mod.total_levels > 0 and not owned:
         raise RuntimeError(
@@ -570,37 +856,37 @@ def _build_inner(context, obj, s, report, t0):
     level = max(1, level)
     quads = len(me.loops) * (4 ** (level - 1))
 
-    # ---- CC 边界校正的对照细分提前算(此刻场景还没有任何重型 multires):
-    #      对照细分是 (基面网格, 级别) 的纯函数, 调用时机不影响其输出 ----
-    t_presub = time.perf_counter()
-    coords_simple = None
-    if s.subdiv_mode == 'CATMULL_CLARK':
-        if pre_mod is not None and pre_mod.total_levels > 0:
-            # 重建场景: 旧层还在, 按住其视口求值(数据不动, 纯环境开销)
-            pre_mod.show_viewport = False
+    # ---- 建层(只为 Multires 数据结构; reshape 会完整覆写 MDISPS) ----
+    # 层数已匹配则整段跳过(重建快路径); 建层在隐藏态跑——细分面从此只当
+    # reshape 的容器, 目标面统一来自 Subsurf 求值, 与建层时的插值源无关
+    if not (owned and mod.total_levels == level):
+        mod.show_viewport = False
         try:
-            coords_simple = _eval_simple_coords(context, obj, level)
+            if mod.total_levels > 0:
+                mod.levels = 0
+                mod.sculpt_levels = 0
+                bpy.ops.object.multires_higher_levels_delete(modifier=mod.name)
+            for _ in range(level):
+                bpy.ops.object.multires_subdivide(modifier=mod.name, mode=s.subdiv_mode)
         finally:
-            if pre_mod is not None and pre_mod.total_levels > 0:
-                pre_mod.show_viewport = True
-        context.view_layer.objects.active = obj
-    t_simple = time.perf_counter()
-
-    # ---- 重置到基面再细分(幂等: 重复应用/换强度不叠加) ----
-    # 注意: 不能在修改器隐藏状态下跑 subdivide——细分算子以当前求值面为插值源,
-    # 隐藏会改变 MDISPS 初始化(实测字节级不等), 只能吃下逐级重求值的开销
-    if mod.total_levels > 0:
-        mod.levels = 0
-        mod.sculpt_levels = 0
-        bpy.ops.object.multires_higher_levels_delete(modifier=mod.name)
-    for _ in range(level):
-        bpy.ops.object.multires_subdivide(modifier=mod.name, mode=s.subdiv_mode)
+            mod.show_viewport = True
     mod.levels = level
     mod.sculpt_levels = level
     mod.render_levels = level
     t_subdiv = time.perf_counter()
 
-    # ---- 求值细分基面(临时关掉其它修改器, 保证 reshape 空间纯净) ----
+    # ---- CC 边界校正的对照细分(Subsurf 线性, 即精确解; 按指纹缓存) ----
+    coords_simple = None
+    if s.subdiv_mode == 'CATMULL_CLARK':
+        mod.show_viewport = False
+        try:
+            coords_simple = _eval_simple_coords(context, obj, level)
+        finally:
+            mod.show_viewport = True
+    t_simple = time.perf_counter()
+
+    # ---- 细分基面: Subsurf 求值副本(拓扑与 multires 逐位一致) ----
+    # 临时关掉其它修改器, 保证 reshape 空间纯净(骨架变形不得混入目标面)
     # 注意: bpy RNA 包装对象不能用 `is` 比较(每次访问都是新包装), 按类型过滤
     saved_vis = [(m, m.show_viewport) for m in obj.modifiers if m.type != 'MULTIRES']
     for m, _ in saved_vis:
@@ -608,18 +894,25 @@ def _build_inner(context, obj, s, report, t0):
     tmp_obj = None
     tmp_me = None
     try:
-        dg = context.evaluated_depsgraph_get()
-        ev = obj.evaluated_get(dg)
-        tmp_me = bpy.data.meshes.new_from_object(
-            ev, preserve_all_data_layers=True, depsgraph=dg)
+        mod.show_viewport = False
+        try:
+            sub_type = 'CATMULL_CLARK' if s.subdiv_mode == 'CATMULL_CLARK' else 'SIMPLE'
+            uv_sm = 'PRESERVE_BOUNDARIES' if sub_type == 'CATMULL_CLARK' else 'NONE'
+            tmp_me = _subsurf_eval_mesh(context, obj, level, sub_type, uv_sm)
+        finally:
+            mod.show_viewport = True
         t_eval = time.perf_counter()
 
         vcount = len(tmp_me.vertices)
+        expected_loops = len(me.loops) * (4 ** (level - 1)) * 4
+        if len(tmp_me.loops) != expected_loops:
+            raise RuntimeError(
+                f"Subsurf 细分拓扑异常: {len(tmp_me.loops):,} vs 预期 {expected_loops:,}")
         lv2 = _read_loop_verts(tmp_me)
         uv2 = _read_loop_uvs(tmp_me)
 
         # 逐 loop 采样(高度 + 基准法线 + 有效权重, 拼一次采样)
-        samp = np.concatenate([field[..., None], rgb_base, wmap[..., None]], axis=2)
+        samp = np.concatenate([field[..., None], n0_enc, wmap[..., None]], axis=2)
         s5 = core.sample_bilinear_wrap(samp, uv2[:, 0], uv2[:, 1])
         h_loop = s5[:, 0].astype(np.float32)
         n0_loop, w0_loop = core.decode_unit_normal(s5[:, 1:4])
@@ -637,7 +930,7 @@ def _build_inner(context, obj, s, report, t0):
                 f"细分拓扑映射失配: {island_of_loop2.shape[0]:,} vs {h_loop.shape[0]:,}")
         h_loop = core.detrend_per_island(h_loop, uv2, island_of_loop2, n_islands, 'PLANE')
         h_loop = core.stitch_islands(h_loop, lv2, island_of_loop2, n_islands)
-        h_loop *= w_loop   # 无效采样(未烘焙背景)不位移
+        h_loop *= w_loop   # 无效采样(未覆盖背景)不位移
         t_np1 = time.perf_counter()
 
         # 沿基准法线位移 × 高度倍数
@@ -682,8 +975,8 @@ def _build_inner(context, obj, s, report, t0):
         co = _read_vert_cos(tmp_me)
 
         # Catmull-Clark(平滑)细分的边界校正: CC 把开放边界向内收缩, 锁位移锁不住
-        # 细分自身的漂移——用同拓扑 SIMPLE 对照细分把边界顶点拉回基面边缘原位,
-        # 校正量沿图距离在 K 环内线性衰减, 平滑融入 CC 内部
+        # 细分自身的漂移——把边界顶点拉回线性细分位置(基面边缘原位), 校正量沿
+        # 图距离在 K 环内线性衰减, 平滑融入 CC 内部
         t_np2 = time.perf_counter()
         corr_stat = ""
         if coords_simple is not None and boundary_verts.size and ecount:
@@ -713,8 +1006,8 @@ def _build_inner(context, obj, s, report, t0):
                      f"p95 {np.percentile(mag, 95) * 1000:.2f} / "
                      f"max {mag.max() * 1000:.2f} (千分之一物体单位)")
         t_displace = time.perf_counter()
-        print(f"[NormalMapToMesh] 位移明细: 对照细分 {t_simple - t_presub:.1f}s"
-              f" + 求值拷贝 {t_eval - t_subdiv:.1f}s"
+        print(f"[NormalMapToMesh] 位移明细: 建层 {t_subdiv - t_front:.1f}s"
+              f" + 对照 {t_simple - t_subdiv:.1f}s + 基面求值 {t_eval - t_simple:.1f}s"
               f" + 采样/岛处理 {t_np1 - t_eval:.1f}s + 锁边/平滑 {t_np2 - t_np1:.1f}s"
               f" + CC校正 {t_ccfix - t_np2:.1f}s + 写坐标 {t_displace - t_ccfix:.1f}s")
 
@@ -750,9 +1043,9 @@ def _build_inner(context, obj, s, report, t0):
     obj["nmtm_scale"] = float(s.disp_scale)
 
     t_end = time.perf_counter()
-    msg = (f"{'材质' if source == 'MATERIAL' else '贴图'}烘焙 {bake_size}px | 级别 {level} | "
+    msg = (f"{'材质' if source == 'MATERIAL' else '贴图'}求值 {bake_size}px | 级别 {level} | "
            f"{quads:,} 四边形 | {disp_stat} | "
-           f"烘焙 {t_bake - t0:.1f}s + 细分 {t_subdiv - t_bake:.1f}s + "
+           f"前端 {t_front - t0:.1f}s + 建层 {t_subdiv - t_front:.1f}s + "
            f"位移 {t_displace - t_subdiv:.1f}s + 写回 {t_end - t_displace:.1f}s "
            f"= {t_end - t0:.1f}s")
     print(f"[NormalMapToMesh] {obj.name}: {msg}")
@@ -769,7 +1062,7 @@ def _poll_mesh(context):
 
 
 class NMTM_OT_build(bpy.types.Operator):
-    """按面板设置构建/更新 Multires 细节(重复执行 = 从基面重建, 可反复调强度)"""
+    """按面板设置构建/更新 Multires 细节(重复执行 = 从基面重建, 可反复调倍数)"""
     bl_idname = "nmtm.build"
     bl_label = "应用 / 更新"
     bl_options = {'REGISTER', 'UNDO'}

@@ -102,6 +102,138 @@ def height_gradients(rgb_detail, rgb_base, pos, min_cos=0.2):
 
 
 # ---------------------------------------------------------------------------
+# 直算前端: UV 三角形光栅化 + 切线空间梯度(免烘焙)
+# ---------------------------------------------------------------------------
+
+def rasterize_tris(tri_uv, tri_attr, size):
+    """UV 三角形光栅化: 逐 texel 重心插值角属性。
+
+    tri_uv (T,3,2) float32, tri_attr (T,3,C) float32 → (grid (S,S,C), mask (S,S))。
+    texel 中心 ((x+0.5)/S, (y+0.5)/S); 按 bbox 尺寸分桶批量向量化;
+    重叠 texel 后写覆盖(与烘焙的任意覆盖语义等价); 退化 UV 三角形跳过。
+    """
+    n_ch = tri_attr.shape[2]
+    grid = np.zeros((size, size, n_ch), np.float32)
+    mask = np.zeros((size, size), bool)
+    if tri_uv.shape[0] == 0:
+        return grid, mask
+    gflat = grid.reshape(-1, n_ch)
+    mflat = mask.reshape(-1)
+
+    uv = tri_uv.astype(np.float64)
+    a, b, c = uv[:, 0], uv[:, 1], uv[:, 2]
+    e1 = b - a
+    e2 = c - a
+    den = e1[:, 0] * e2[:, 1] - e1[:, 1] * e2[:, 0]
+    ok = np.abs(den) > 1e-14
+
+    px_min = np.minimum(np.minimum(a, b), c) * size - 0.5
+    px_max = np.maximum(np.maximum(a, b), c) * size - 0.5
+    x0 = np.clip(np.ceil(px_min[:, 0]), 0, size - 1).astype(np.int64)
+    y0 = np.clip(np.ceil(px_min[:, 1]), 0, size - 1).astype(np.int64)
+    x1 = np.clip(np.floor(px_max[:, 0]), 0, size - 1).astype(np.int64)
+    y1 = np.clip(np.floor(px_max[:, 1]), 0, size - 1).astype(np.int64)
+    side = np.maximum(x1 - x0 + 1, y1 - y0 + 1)
+    ok &= (x1 >= x0) & (y1 >= y0)
+
+    order = np.argsort(side, kind='stable')
+    eps = 1e-6
+    for k in (4, 8, 16, 32, 64, 128, 256, 1 << 30):
+        sel = order[ok[order] & (side[order] <= k)]
+        if sel.size == 0:
+            continue
+        order = order[~np.isin(order, sel, assume_unique=True)]
+        kk = int(min(k, size))
+        # 控制单块内存: n*kk*kk ≤ ~4M texel
+        chunk = max(1, (4_000_000 // (kk * kk)))
+        for s0 in range(0, sel.size, chunk):
+            t = sel[s0:s0 + chunk]
+            n = t.size
+            xs = x0[t][:, None] + np.arange(kk)[None, :]           # (n,kk)
+            ys = y0[t][:, None] + np.arange(kk)[None, :]
+            vx = xs <= x1[t][:, None]
+            vy = ys <= y1[t][:, None]
+            u = (xs.astype(np.float64) + 0.5) / size
+            v = (ys.astype(np.float64) + 0.5) / size
+            pu = u[:, None, :] - a[t, 0][:, None, None]            # (n,kk,kk)
+            pv = v[:, :, None] - a[t, 1][:, None, None]
+            d = den[t][:, None, None]
+            l1 = (pu * e2[t, 1][:, None, None] - pv * e2[t, 0][:, None, None]) / d
+            l2 = (e1[t, 0][:, None, None] * pv - e1[t, 1][:, None, None] * pu) / d
+            l0 = 1.0 - l1 - l2
+            inside = ((l0 >= -eps) & (l1 >= -eps) & (l2 >= -eps)
+                      & vx[:, None, :] & vy[:, :, None])
+            if not inside.any():
+                continue
+            attr = tri_attr[t]                                     # (n,3,C)
+            vals = (l0[..., None] * attr[:, 0][:, None, None, :]
+                    + l1[..., None] * attr[:, 1][:, None, None, :]
+                    + l2[..., None] * attr[:, 2][:, None, None, :])
+            gi = ys[:, :, None] * size + xs[:, None, :]            # (n,kk,kk)
+            idx = gi[inside]
+            gflat[idx] = vals[inside].astype(np.float32)
+            mflat[idx] = True
+        if order.size == 0:
+            break
+    return grid, mask
+
+
+def dilate_grid(grid, mask, iters):
+    """有效区向外扩 iters 圈(4邻域均值填充), 作用等价烘焙 margin:
+    岛边界的双线性采样不吃到无效 texel。返回 (grid, mask) 新数组。"""
+    g = grid.copy()
+    m = mask.copy()
+    for _ in range(iters):
+        if m.all():
+            break
+        nb_sum = np.zeros_like(g)
+        nb_cnt = np.zeros(m.shape, np.float32)
+        for sh, ax in ((1, 0), (-1, 0), (1, 1), (-1, 1)):
+            ms = np.roll(m, sh, axis=ax)
+            gs = np.roll(g, sh, axis=ax)
+            w = ms.astype(np.float32)
+            nb_sum += gs * w[..., None]
+            nb_cnt += w
+        fill = (~m) & (nb_cnt > 0)
+        g[fill] = nb_sum[fill] / nb_cnt[fill][:, None]
+        m = m | fill
+    return g, m
+
+
+def gradients_from_tangent_frames(t_xyz, tan_grid, nrm_grid, sign_grid,
+                                  pu_grid, pv_grid, mask, min_cos=0.2):
+    """切线空间法线网格 + 光栅化切线帧 → UV 高度梯度(免烘焙直算)。
+
+    与烘焙路径同一代数(逐 texel): n1 ∝ T·tx + B·ty + N·tz, B = sign·(N×T),
+    g = n0 − n1/max(n1·n0, min_cos) 化简为 g = −(T·tx + B·ty)/max(tz, min_cos·|t|),
+    dh/du = g·∂P/∂u, dh/dv = g·∂P/∂v (∂P 为逐三角形解析常量, 无沟槽假差分)。
+    |t| 异常(未覆盖/坏像素)或 cos ≤ min_cos 的 texel 权重归零。
+    """
+    tx = t_xyz[..., 0]
+    ty = t_xyz[..., 1]
+    tz = t_xyz[..., 2]
+    ln = np.sqrt(tx * tx + ty * ty + tz * tz)
+    cosw = tz / np.maximum(ln, 1e-12)
+    w = (mask & (ln > 0.25) & (ln < 2.25) & (cosw > min_cos)).astype(np.float32)
+
+    bx = sign_grid * (nrm_grid[..., 1] * tan_grid[..., 2] - nrm_grid[..., 2] * tan_grid[..., 1])
+    by = sign_grid * (nrm_grid[..., 2] * tan_grid[..., 0] - nrm_grid[..., 0] * tan_grid[..., 2])
+    bz = sign_grid * (nrm_grid[..., 0] * tan_grid[..., 1] - nrm_grid[..., 1] * tan_grid[..., 0])
+
+    denom = np.maximum(tz, np.float32(min_cos) * ln)
+    denom = np.maximum(denom, 1e-12)
+    fx = tx / denom
+    fy = ty / denom
+    gvx = -(tan_grid[..., 0] * fx + bx * fy)
+    gvy = -(tan_grid[..., 1] * fx + by * fy)
+    gvz = -(tan_grid[..., 2] * fx + bz * fy)
+
+    gx = (gvx * pu_grid[..., 0] + gvy * pu_grid[..., 1] + gvz * pu_grid[..., 2]) * w
+    gy = (gvx * pv_grid[..., 0] + gvy * pv_grid[..., 1] + gvz * pv_grid[..., 2]) * w
+    return gx.astype(np.float32), gy.astype(np.float32), w
+
+
+# ---------------------------------------------------------------------------
 # Frankot-Chellappa 频域泊松积分
 # ---------------------------------------------------------------------------
 
@@ -382,6 +514,39 @@ def _selftest():
     n1_bad[:8] = 0.0
     gxb, gyb, wb = height_gradients(n1_bad, enc(np.array(n0_vec)), pos)
     assert wb[:8].max() == 0.0 and np.abs(gxb[:4]).max() == 0.0, "背景未归零"
+
+    # ---- 直算前端: 光栅化切线帧 + 免烘焙梯度, 应还原同一高度场 ----
+    # 两个大三角覆盖全 UV 方格; 平面绕 Z 30°, 尺度 A×B(同上), T=ex, B=ey, sign=+1
+    pu_v = (A * ex).astype(np.float32)
+    pv_v = (B * ey).astype(np.float32)
+    corner = np.array([[-0.2, -0.2], [1.4, -0.2], [-0.2, 1.4],
+                       [1.4, -0.2], [1.4, 1.4], [-0.2, 1.4]], np.float32)
+    tri_uv = corner.reshape(2, 3, 2)
+    attr1 = np.concatenate([ex, ez, [1.0], pu_v, pv_v]).astype(np.float32)   # C=13
+    tri_attr = np.broadcast_to(attr1, (2, 3, 13)).copy()
+    grid, gmask = rasterize_tris(tri_uv, tri_attr, w2)
+    assert gmask.all(), "全覆盖光栅化出现空洞"
+    # 合成切线空间法线贴图: t ∝ (−dh/dx, −dh/dy, 1) (x=u·A 世界轴)
+    t_map = np.stack([-(dh_du / A), -(dh_dv / B), np.ones_like(dh_du)], axis=-1)
+    t_map = (t_map / np.linalg.norm(t_map, axis=-1, keepdims=True)).astype(np.float32)
+    gxd, gyd, wd = gradients_from_tangent_frames(
+        t_map, grid[..., 0:3], grid[..., 3:6], grid[..., 6],
+        grid[..., 7:10], grid[..., 10:13], gmask)
+    assert wd.min() > 0.99, "直算权重异常"
+    rec_d = integrate_height(gxd, gyd).astype(np.float64)
+    diff_d = rec_d - height
+    diff_d -= diff_d.mean()
+    rel_d = np.sqrt(np.mean(diff_d ** 2)) / np.sqrt(np.mean(height ** 2))
+    print(f"[直算前端] 光栅化+切线帧梯度 相对RMS误差 = {rel_d:.2e}")
+    assert rel_d < 2e-2, "直算前端还原失败"
+
+    # 膨胀: 挖洞后 4 圈填充应恢复邻域值
+    hole = grid.copy()
+    hmask = gmask.copy()
+    hmask[100:104, 100:104] = False
+    hole[100:104, 100:104] = 0.0
+    filled, fmask = dilate_grid(hole, hmask, 4)
+    assert fmask.all() and abs(float(filled[101, 101, 0]) - float(grid[101, 101, 0])) < 1e-5
 
     # ---- FC 积分基准面锚定 ----
     r2 = (ug - 0.5) ** 2 + (vg - 0.5) ** 2
