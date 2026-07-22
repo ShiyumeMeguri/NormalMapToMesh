@@ -1,27 +1,20 @@
 # -*- coding: utf-8 -*-
 # NormalMapToMesh 操作层 —— bpy 侧: 直算前端(免烘焙)、Multires 管理、
-# Subsurf 统一细分求值、numpy 位移、multires_reshape 写回。
+# SIMPLE 细分求值、numpy 位移、multires_reshape 写回。
 #
-# v4 架构(默认全程免 Cycles):
+# v6 不变式: 一切场量只由低模 + 法线贴图决定, 细分只是采样密度——任何级别
+# 都输出同一张曲面(shader 逐像素求值的几何化), 位移管线不读细分网格自身的
+# 任何属性(离散角法线/CC 坐标皆禁)。
 #   1. 直算前端: mikktspace 切线帧(calc_tangents, 与渲染器同源)+逐三角形解析
-#      ∂P/∂u,∂P/∂v 光栅化到 UV 网格; 材质法线链用 numpy 节点求值器直接算
-#      (游戏导入材质的通道重建网络节点种类有限), 切线空间法线图 + 切线帧
-#      → 高度梯度。不支持的节点/网格自动回退 v3 的 Cycles EMIT 三图烘焙。
-#   2. FC 频域泊松积分 → 物理高度场(平贴严格 0)。
-#   3. Multires 建层只为数据结构(隐藏态跑 subdivide, 免逐级重求值;
-#      reshape 会完整覆写 MDISPS); 重建时层数匹配则整段跳过。
-#   4. 细分基面统一用 Subsurf 求值副本(拓扑与 multires 逐位一致, 实测):
-#      免去 1M 顶点 multires 求值, 也让"重建"不再需要删层重细分。
-#   5. 采样高度 → 逐岛去趋势/缝合 → 边缘锁定/位移平滑 → CC 边界校正
-#      (SIMPLE 对照 = Subsurf 线性细分, 即精确解) → multires_reshape 写回。
-#
-# 曲率来源 = 真正的 Catmull-Clark 细分(subdiv_mode 可选), 不是解析鼓起近似:
-# 曾尝试 Phong Tessellation(线性基面 + 逐三角形 PN 鼓起)替代 CC, 已废弃——
-# PN 鼓起是逐三角形独立的局部方案, 只保证跨面位置连续(C0), 不保证曲率连续;
-# 真实资产的平滑法线场相邻三角形间常有数十度量级的独立偏差(非自定义法线,
-# 就是 Blender auto-smooth 算出来的), 每个三角形各自把这份偏差鼓成几何,
-# 大量三角形密集重复即成表面皱纹。CC 细分是全局迭代平均, 收敛到 C2 光滑
-# 极限曲面, 没有这个病理, 这也是它在此类资产上必须优先于 PN 方案的原因。
+#      ∂P/∂u,∂P/∂v 光栅化到 UV 网格; 材质法线链用 numpy 节点求值器直接算,
+#      切线空间法线图 + 切线帧 → 高度梯度。不支持的节点/网格回退 EMIT 三图烘焙。
+#   2. 镜像 Neumann 泊松积分 → 物理高度场(平贴严格 0) → 开放边界距离衰减。
+#   3. Multires 建层只为数据结构(隐藏态跑 subdivide; reshape 完整覆写 MDISPS);
+#      重建时层数匹配则整段跳过。
+#   4. 细分基面 = SIMPLE Subsurf 求值副本(拓扑与 multires 逐位一致, 实测),
+#      顶点严格落在低模面上; 低模平滑角法线以 corner 属性随细分线性插值——
+#      位移方向即 shader 的逐像素插值法线场, 面内 C∞。
+#   5. 采样高度(B 样条 C2) → 逐岛去趋势/缝合 → 边界硬锁 → 位移 → reshape 写回。
 #
 # 重复点"应用"= 从基面重建(幂等), 改倍数即所见即所得(全缓存命中, 只剩写回)。
 
@@ -40,7 +33,6 @@ BAKE_SAMPLES = 1   # EMIT 烘焙无噪声, 1 采样足够(回退路径)
 # 运行期缓存(只认网格/材质"身份", 不追踪材质节点内容变化)
 _grad_cache = {}     # 前端结果: (gx, gy, wmap)
 _island_cache = {}
-_simple_cache = {}   # SIMPLE 对照细分坐标
 
 
 def _cache_put(cache, key, val, cap=2):
@@ -53,7 +45,6 @@ def _cache_put(cache, key, val, cap=2):
 def clear_caches():
     _grad_cache.clear()
     _island_cache.clear()
-    _simple_cache.clear()
 
 
 # ---------------------------------------------------------------------------
@@ -782,25 +773,31 @@ def _bake_triple(context, obj, source, image, bake_size, loop_uv):
 
 
 # ---------------------------------------------------------------------------
-# Subsurf 统一细分求值(拓扑与 multires 逐位一致, 实测)
+# SIMPLE 细分求值(拓扑与 multires 逐位一致, 实测)
 # ---------------------------------------------------------------------------
 
-def _subsurf_eval_mesh(context, obj, level, sub_type, uv_smooth):
-    """网格副本 + Subsurf 求值 → 新 Mesh 数据块(调用方负责删除)。
+def _subsurf_eval_mesh(context, obj, level):
+    """网格副本 + SIMPLE Subsurf 求值 → 新 Mesh 数据块(调用方负责删除)。
 
     无算子、无选择/撤销依赖, 也天然不受 Mesh 里已有 MDISPS 影响(Subsurf 忽略之)。
-    拓扑/顶点序与 multires 求值逐位一致(实测); SIMPLE+uv_smooth=NONE 即精确线性细分。
+    顶点严格落在低模面上(线性细分), UV 同为线性插值——与 shader 的重心插值同构。
+    副本上先把低模平滑角法线写成 corner 属性 NMTM_N0: SIMPLE 细分对 generic
+    属性做纯线性插值, 求值网格即携带连续法线场(位移方向), 全程零高模数据。
     """
     me2 = obj.data.copy()
+    nrm = np.empty(len(me2.loops) * 3, np.float32)
+    me2.corner_normals.foreach_get("vector", nrm)
+    attr = me2.attributes.new("NMTM_N0", 'FLOAT_VECTOR', 'CORNER')
+    attr.data.foreach_set("vector", nrm)
     tmp_o = bpy.data.objects.new("NMTM_subd_tmp", me2)
     context.scene.collection.objects.link(tmp_o)
     try:
         mod = tmp_o.modifiers.new("NMTM_subd", 'SUBSURF')
-        mod.subdivision_type = sub_type
+        mod.subdivision_type = 'SIMPLE'
         mod.levels = level
         mod.render_levels = level
         mod.quality = 4                  # multires 默认
-        mod.uv_smooth = uv_smooth
+        mod.uv_smooth = 'NONE'
         mod.boundary_smooth = 'ALL'
         dg = context.evaluated_depsgraph_get()
         out = bpy.data.meshes.new_from_object(tmp_o.evaluated_get(dg),
@@ -814,91 +811,24 @@ def _subsurf_eval_mesh(context, obj, level, sub_type, uv_smooth):
     return out
 
 
-def _eval_simple_coords(context, obj, level):
-    """同级 SIMPLE(线性)细分坐标 (V,3) —— CC 边界校正的目标位置。按指纹缓存。"""
-    me = obj.data
-    key = (me.name_full, len(me.vertices), len(me.loops), int(level), 'simple')
-    got = _simple_cache.get(key)
-    if got is not None:
-        return got
-    tm = _subsurf_eval_mesh(context, obj, level, 'SIMPLE', 'NONE')
-    try:
-        coords = _read_vert_cos(tm).copy()
-    finally:
-        bpy.data.meshes.remove(tm)
-    _cache_put(_simple_cache, key, coords)
-    return coords
-
-
-def _phong_normals_for_loops(me, loop_uv, uv2, base_face_of_loop2, fallback_nrm):
-    """shader 等价法线场: 逐细分 loop 在其基面的扇形三角化里按 UV 重心插值
-    基面平滑角法线——面内解析光滑(Phong), 与渲染器逐像素插值同构。
-
-    细分网格自己重算的角法线是离散近似(SIMPLE 下面内恒为面法线, 逐基面跳变),
-    位移方向用它会把离散噪声刻进表面; 插值基面法线才是"SDF 场式"的光滑求值。
-    UV 退化/数值失败的 loop 回退 fallback_nrm(细分网格角法线)。
-
-    注意: 这只用于**位移方向**(单位向量场, 3 分量归一化, 后果只是细节位移
-    朝向的轻微偏差), 不用于任何几何位置偏移——不会重蹈 Phong Tessellation
-    (逐三角形位置鼓起, 已废弃)的覆辙。
-    """
-    n_base = len(me.loops)
-    nrm = np.empty(n_base * 3, np.float32)
-    me.corner_normals.foreach_get("vector", nrm)
-    nrm = nrm.reshape(-1, 3).astype(np.float64)
-
-    loop_start = np.empty(len(me.polygons), np.int64)
-    me.polygons.foreach_get("loop_start", loop_start)
-    loop_total = np.empty(len(me.polygons), np.int64)
-    me.polygons.foreach_get("loop_total", loop_total)
-
-    f = base_face_of_loop2
-    ls = loop_start[f]
-    lt = loop_total[f]
-    n2 = uv2.shape[0]
-    out = np.zeros((n2, 3), np.float64)
-    found = np.zeros(n2, bool)
-    uv = loop_uv.astype(np.float64)
-    p = uv2.astype(np.float64)
-    eps = 1e-4
-    max_fan = int(loop_total.max()) - 2
-    for k in range(max_fan):
-        act = np.flatnonzero((~found) & (k < lt - 2))
-        if act.size == 0:
-            break
-        i0 = ls[act]
-        i1 = i0 + k + 1
-        i2 = i0 + k + 2
-        a = uv[i0]
-        b = uv[i1]
-        c = uv[i2]
-        pa = p[act] - a
-        e1 = b - a
-        e2 = c - a
-        det = e1[:, 0] * e2[:, 1] - e1[:, 1] * e2[:, 0]
-        ok_det = np.abs(det) > 1e-14
-        det_s = np.where(ok_det, det, 1.0)
-        l1 = (pa[:, 0] * e2[:, 1] - pa[:, 1] * e2[:, 0]) / det_s
-        l2 = (e1[:, 0] * pa[:, 1] - e1[:, 1] * pa[:, 0]) / det_s
-        l0 = 1.0 - l1 - l2
-        last = k >= (lt[act] - 3)   # 最后一块扇形: 夹取兜底(数值边界不落空)
-        inside = ok_det & (((l0 >= -eps) & (l1 >= -eps) & (l2 >= -eps)) | last)
-        if not inside.any():
-            continue
-        sel = act[inside]
-        w0 = np.clip(l0[inside], 0.0, 1.0)
-        w1 = np.clip(l1[inside], 0.0, 1.0)
-        w2 = np.clip(l2[inside], 0.0, 1.0)
-        vec = (nrm[i0[inside]] * w0[:, None] + nrm[i1[inside]] * w1[:, None]
-               + nrm[i2[inside]] * w2[:, None])
-        out[sel] = vec
-        found[sel] = True
-    ln = np.linalg.norm(out, axis=1)
-    bad = (~found) | (ln < 1e-6)
-    if bad.any():
-        out[bad] = fallback_nrm[bad]
-        ln = np.linalg.norm(out, axis=1)
-    return (out / np.maximum(ln, 1e-12)[:, None]).astype(np.float32)
+def _open_edge_segments(me, loop_uv):
+    """低模开放边(单面边) → UV 线段端点对 (E,2,2), 供边缘衰减场。"""
+    ecount = len(me.edges)
+    if ecount == 0 or len(me.loops) == 0:
+        return np.zeros((0, 2, 2), np.float32)
+    le = np.empty(len(me.loops), np.int32)
+    me.loops.foreach_get("edge_index", le)
+    open_edge = np.bincount(le, minlength=ecount) == 1
+    if not open_edge.any():
+        return np.zeros((0, 2, 2), np.float32)
+    ls = np.empty(len(me.polygons), np.int64)
+    me.polygons.foreach_get("loop_start", ls)
+    lt = np.empty(len(me.polygons), np.int64)
+    me.polygons.foreach_get("loop_total", lt)
+    nxt = np.arange(len(me.loops), dtype=np.int64) + 1
+    nxt[ls + lt - 1] = ls                      # 面内环回: 末角的下一角是首角
+    sel = np.flatnonzero(open_edge[le])
+    return np.stack([loop_uv[sel], loop_uv[nxt[sel]]], axis=1).astype(np.float32)
 
 
 def _get_island_labels(me, loop_vert, loop_uv, loop_total):
@@ -1010,17 +940,27 @@ def _build_inner(context, obj, s, report, t0):
     level = max(1, level)
     quads = len(me.loops) * (4 ** (level - 1))
 
-    # ---- FC 积分 (无风格化模糊) ----
+    # ---- Neumann(镜像)积分 (无风格化模糊) ----
     # 唯一的带限 = 顶点 Nyquist 抗混叠下限(采样理论要求, 非平滑参数):
     # 顶点间距粗于 texel 时, texel 级信号无法被网格表达, 不滤除即成混叠颗粒;
     # 自动级别(1 四边形/texel)下该下限为 0——完全无损
     texels_per_edge = float(np.sqrt(bake_size * bake_size * fill / max(quads, 1)))
     sigma_floor = 0.6 * texels_per_edge if texels_per_edge > 1.0 else 0.0
     field = core.integrate_height(
-        gx, gy, 0.0, (sigma_floor / bake_size) if sigma_floor > 0 else 0.0)
+        gx, gy, smooth_sigma=(sigma_floor / bake_size) if sigma_floor > 0 else 0.0)
+
+    # 开放边界(卡片边缘)衰减: 高度场沿 UV 距离场 smoothstep 归零。场量属于
+    # 低模 UV 域, 与细分级别无关; 边界顶点另有硬锁零位移兜底
+    fall_stat = ""
+    if int(s.edge_falloff_px) > 0:
+        seg = _open_edge_segments(me, loop_uv)
+        if seg.shape[0]:
+            field = field * core.edge_falloff_field(seg, bake_size,
+                                                    int(s.edge_falloff_px))
+            fall_stat = f" | 边缘衰减 {int(s.edge_falloff_px)}px/{seg.shape[0]:,}段"
     print(f"[NormalMapToMesh] 梯度有效率 {wmap.mean():.1%} | "
           f"高度场 p95 {np.percentile(np.abs(field[wmap > 0]), 95) * 1000:.2f}‰ | "
-          f"抗混叠下限 σ {sigma_floor:.2f}px")
+          f"抗混叠下限 σ {sigma_floor:.2f}px{fall_stat}")
 
     # ---- 建层(只为 Multires 数据结构; reshape 会完整覆写 MDISPS) ----
     # 层数已匹配则整段跳过(重建快路径); 建层在隐藏态跑——细分面从此只当
@@ -1033,25 +973,17 @@ def _build_inner(context, obj, s, report, t0):
                 mod.sculpt_levels = 0
                 bpy.ops.object.multires_higher_levels_delete(modifier=mod.name)
             for _ in range(level):
-                bpy.ops.object.multires_subdivide(modifier=mod.name, mode=s.subdiv_mode)
+                bpy.ops.object.multires_subdivide(modifier=mod.name, mode='SIMPLE')
         finally:
             mod.show_viewport = True
     mod.levels = level
     mod.sculpt_levels = level
     mod.render_levels = level
+    if hasattr(mod, "uv_smooth"):
+        mod.uv_smooth = 'NONE'          # 最终对象 UV 与采样时的线性插值一致
     t_subdiv = time.perf_counter()
 
-    # ---- CC 边界校正的对照细分(Subsurf 线性, 即精确解; 按指纹缓存) ----
-    coords_simple = None
-    if s.subdiv_mode == 'CATMULL_CLARK':
-        mod.show_viewport = False
-        try:
-            coords_simple = _eval_simple_coords(context, obj, level)
-        finally:
-            mod.show_viewport = True
-    t_simple = time.perf_counter()
-
-    # ---- 细分基面: Subsurf 求值副本(拓扑与 multires 逐位一致) ----
+    # ---- 细分基面: SIMPLE Subsurf 求值副本(拓扑与 multires 逐位一致) ----
     # 临时关掉其它修改器, 保证 reshape 空间纯净(骨架变形不得混入目标面)
     # 注意: bpy RNA 包装对象不能用 `is` 比较(每次访问都是新包装), 按类型过滤
     saved_vis = [(m, m.show_viewport) for m in obj.modifiers if m.type != 'MULTIRES']
@@ -1062,9 +994,7 @@ def _build_inner(context, obj, s, report, t0):
     try:
         mod.show_viewport = False
         try:
-            sub_type = 'CATMULL_CLARK' if s.subdiv_mode == 'CATMULL_CLARK' else 'SIMPLE'
-            uv_sm = 'PRESERVE_BOUNDARIES' if sub_type == 'CATMULL_CLARK' else 'NONE'
-            tmp_me = _subsurf_eval_mesh(context, obj, level, sub_type, uv_sm)
+            tmp_me = _subsurf_eval_mesh(context, obj, level)
         finally:
             mod.show_viewport = True
         t_eval = time.perf_counter()
@@ -1093,15 +1023,17 @@ def _build_inner(context, obj, s, report, t0):
         if island_of_loop2.shape[0] != h_loop.shape[0]:
             raise RuntimeError(
                 f"细分拓扑映射失配: {island_of_loop2.shape[0]:,} vs {h_loop.shape[0]:,}")
-        base_face_of_loop2 = np.repeat(
-            np.repeat(np.arange(len(me.polygons), dtype=np.int64), per_face), 4)
 
-        # 位移方向 = 基面平滑角法线在表面插值位置的 Phong 插值(shader 等价的
-        # 解析光滑法线场)——细分网格重算的角法线是离散近似, 会刻入面级噪声
-        fb = np.empty(len(tmp_me.loops) * 3, np.float32)
-        tmp_me.corner_normals.foreach_get("vector", fb)
-        n0_loop = _phong_normals_for_loops(me, loop_uv, uv2, base_face_of_loop2,
-                                           fb.reshape(-1, 3).astype(np.float64))
+        # 位移方向 = 低模平滑角法线经 SIMPLE 细分线性插值的连续场(NMTM_N0 角
+        # 属性), 插值后归一化——与 shader 逐像素插值法线同构, 面内 C∞;
+        # 细分网格自身重算的离散角法线(SIMPLE 下逐基面跳变)禁止入场
+        n0_attr = tmp_me.attributes.get("NMTM_N0")
+        if n0_attr is None:
+            raise RuntimeError("细分求值丢失 NMTM_N0 角法线属性(Subsurf 未插值 corner 属性?)")
+        nbuf = np.empty(len(tmp_me.loops) * 3, np.float32)
+        n0_attr.data.foreach_get("vector", nbuf)
+        n0_loop = nbuf.reshape(-1, 3)
+        n0_loop /= np.maximum(np.linalg.norm(n0_loop, axis=1), 1e-12)[:, None]
         h_loop = core.detrend_per_island(h_loop, uv2, island_of_loop2, n_islands, 'PLANE')
         h_loop = core.stitch_islands(h_loop, lv2, island_of_loop2, n_islands)
         h_loop *= w_loop   # 无效采样(未覆盖背景)不位移
@@ -1115,10 +1047,9 @@ def _build_inner(context, obj, s, report, t0):
         amp_vert = h_vert * np.float32(s.disp_scale) * (ln > 0.1).astype(np.float32)
         dvec = n0_vert * amp_vert[:, None]
 
-        # 边缘锁定 + 位移场平滑(等价: 多级精度平滑后沿边缘刷"擦除多级精度置换"):
-        # 开放边界顶点(卡片边缘)位移严格归零——边缘偏移会把原本贴合的卡片边
-        # 撕出缝隙, 基面边缘本来就是对的; 再对位移向量场做图拉普拉斯平滑
-        # (边界 Dirichlet 0), 位移向边缘平滑衰减, 同时去除高频斑点。
+        # 边界硬锁: 开放边界顶点(卡片边缘)位移严格归零——边缘偏移会把原本
+        # 贴合的卡片边撕出缝隙, 基面边缘本来就是对的; 平滑衰减带已在高度场
+        # UV 域完成(edge_falloff_px, 细分不变), 此处只做精确兜底
         ecount = len(tmp_me.edges)
         ev = np.empty(ecount * 2, np.int32)
         tmp_me.edges.foreach_get("vertices", ev)
@@ -1127,77 +1058,24 @@ def _build_inner(context, obj, s, report, t0):
         tmp_me.loops.foreach_get("edge_index", le)
         edge_face_count = np.bincount(le, minlength=ecount)
         boundary_verts = np.unique(ev[edge_face_count[:ecount] == 1].ravel())
-        e0 = ev[:, 0].astype(np.int64)
-        e1 = ev[:, 1].astype(np.int64)
         if boundary_verts.size:
             dvec[boundary_verts] = 0.0
-        iters = int(s.edge_smooth_iters)
-        if iters > 0 and ecount:
-            deg = (np.bincount(e0, minlength=vcount)
-                   + np.bincount(e1, minlength=vcount)).astype(np.float64)
-            deg = np.maximum(deg, 1.0)
-            for _ in range(iters):
-                nb = np.empty_like(dvec)
-                for c in range(3):
-                    sc = (np.bincount(e0, weights=dvec[e1, c], minlength=vcount)
-                          + np.bincount(e1, weights=dvec[e0, c], minlength=vcount))
-                    nb[:, c] = (sc / deg).astype(np.float32)
-                dvec = 0.5 * dvec + 0.5 * nb
-                if boundary_verts.size:
-                    dvec[boundary_verts] = 0.0
+        t_np2 = time.perf_counter()
 
         co = _read_vert_cos(tmp_me)
-
-        # Catmull-Clark(平滑)细分的边界校正: CC 把开放边界向内收缩, 锁位移锁不住
-        # 细分自身的漂移——把边界顶点拉回线性细分位置(基面边缘原位), 校正量沿
-        # 图距离在 K 环内线性衰减, 平滑融入 CC 内部
-        t_np2 = time.perf_counter()
-        corr_stat = ""
-        if coords_simple is not None and boundary_verts.size and ecount:
-            if coords_simple.shape[0] != vcount:
-                print(f"[NormalMapToMesh] 警告: SIMPLE 对照细分拓扑不匹配"
-                      f"({coords_simple.shape[0]:,} vs {vcount:,}), 跳过边界校正")
-            else:
-                k_rings = max(2, 2 ** (level - 1))
-                dist = np.full(vcount, k_rings + 1, np.int32)
-                dist[boundary_verts] = 0
-                for _ in range(k_rings):
-                    np.minimum.at(dist, e1, dist[e0] + 1)
-                    np.minimum.at(dist, e0, dist[e1] + 1)
-                # smoothstep(C1) + 图扩散: 整数环的线性渐变在每环边界有导数跳变,
-                # 会沿所有卡片边缘拉出脊线——抹成连续混合场(端点钉死)
-                s_lin = np.clip(1.0 - dist.astype(np.float32) / k_rings, 0.0, 1.0)
-                wgt = (s_lin * s_lin * (3.0 - 2.0 * s_lin)).astype(np.float32)
-                deg_w = (np.bincount(e0, minlength=vcount)
-                         + np.bincount(e1, minlength=vcount)).astype(np.float64)
-                deg_w = np.maximum(deg_w, 1.0)
-                pin1 = dist == 0
-                pin0 = dist > k_rings
-                for _ in range(4):
-                    sw = (np.bincount(e0, weights=wgt[e1], minlength=vcount)
-                          + np.bincount(e1, weights=wgt[e0], minlength=vcount))
-                    wgt = (0.5 * wgt + 0.5 * (sw / deg_w)).astype(np.float32)
-                    wgt[pin1] = 1.0
-                    wgt[pin0] = 0.0
-                corr = (coords_simple - co) * wgt[:, None]
-                co += corr
-                corr_stat = (f" | CC边界校正 max "
-                             f"{np.linalg.norm(corr, axis=1).max() * 1000:.2f}‰/{k_rings}环")
-
-        t_ccfix = time.perf_counter()
         co += dvec
         tmp_me.vertices.foreach_set("co", co.ravel())
         tmp_me.update()
         mag = np.linalg.norm(dvec, axis=1)
-        disp_stat = (f"{n_islands} 岛 | 边界锁定 {boundary_verts.size:,} 顶点{corr_stat} | "
+        disp_stat = (f"{n_islands} 岛 | 边界锁定 {boundary_verts.size:,} 顶点 | "
                      f"位移幅值 p50 {np.percentile(mag, 50) * 1000:.2f} / "
                      f"p95 {np.percentile(mag, 95) * 1000:.2f} / "
                      f"max {mag.max() * 1000:.2f} (千分之一物体单位)")
         t_displace = time.perf_counter()
         print(f"[NormalMapToMesh] 位移明细: 建层 {t_subdiv - t_front:.1f}s"
-              f" + 对照 {t_simple - t_subdiv:.1f}s + 基面求值 {t_eval - t_simple:.1f}s"
-              f" + 采样/岛处理 {t_np1 - t_eval:.1f}s + 锁边/平滑 {t_np2 - t_np1:.1f}s"
-              f" + CC校正 {t_ccfix - t_np2:.1f}s + 写坐标 {t_displace - t_ccfix:.1f}s")
+              f" + 基面求值 {t_eval - t_subdiv:.1f}s"
+              f" + 采样/岛处理 {t_np1 - t_eval:.1f}s + 锁边 {t_np2 - t_np1:.1f}s"
+              f" + 写坐标 {t_displace - t_np2:.1f}s")
 
         # ---- reshape 写回 Multires 位移层 ----
         tmp_obj = bpy.data.objects.new("NMTM_reshape_tmp", tmp_me)

@@ -1,21 +1,22 @@
 # -*- coding: utf-8 -*-
 # NormalMapToMesh 数学内核 —— 纯 numpy, 不依赖 bpy, 可用 `python core.py` 独立自测。
 #
-# v3 烘焙高度重建管线: 切线基交给渲染器——用 Cycles EMIT 烘焙三张物体空间图:
-#   n1 = 带法线贴图的扰动法线(材质 Normal Map 节点输出, 世界→物体空间编码)
-#   n0 = 纯平滑基准法线(Geometry.Normal)
-#   P  = 表面位置(Geometry.Position, 物体空间, 原始浮点)
-# 每 texel 的高度梯度零猜测装配: 3D 坡度 g = n0 − n1/(n1·n0) (切平面向量, |g|=tanθ),
-#   dh/du = g·∂P/∂u, dh/dv = g·∂P/∂v (∂P 由 P 图中心差分得到)。
-# 镜像 UV 岛/逐岛任意旋转切线帧/绿通道约定/通道重建网络全部由烘焙数据自动携带,
-# 且梯度直接是"物体单位/UV", 积分出的高度就是物理高度(倍数 1.0 = 真实浮雕)。
-# 之后走 Frankot-Chellappa 频域泊松积分 → 逐岛去趋势 → 岛间缝合 → 沿 n0 位移。
+# v6 不变式: 一切场量只由低模 + 法线贴图决定, 细分只是对同一连续曲面的采样密度
+# ——任何细分方式/级别都必须输出同一张曲面(shader 逐像素求值的几何化)。
+# 直算前端(ops 侧)光栅化 mikktspace 切线帧标量 → 逐 texel 高度梯度
+#   dh/du = −(au·fx + bu·fy), fx = tx/tz (au=T·∂P/∂u 等为逐角解析标量),
+# 镜像扩展 Neumann 最小二乘积分出物理高度 → 逐岛去趋势 → 岛间缝合 →
+# 沿低模平滑角法线的线性插值场位移(与 shader 逐像素插值同构)。
+# 烘焙路径(Cycles EMIT 三图: n1/n0/P, 同一套梯度代数)仅作不支持节点的回退。
 #
 # 历史教训:
 # - v1 直接按"UV 轴=切线轴"解读贴图梯度做全局积分——真实资产逐岛切线帧任意旋转
 #   +镜像混合手性, 前提性失败。
 # - v2 差分位移(n1−n0)×scale——幅值与细节波长无关, 高频发丝沟壑位移超过顶点间距,
 #   表面撕碎; 坡度必须先积分成高度(高频自动得到小高度)才物理正确。
+# - v3~v5 周期 FFT 积分 + CC/PN 弯曲基面: wrap-around 让岛间隔着图集边界互相
+#   泄漏低频; 弯曲基面/细分网格离散法线引入细分方式依赖——shader 从不弯曲基面,
+#   位移场也从不该读细分网格自身的任何数据。
 
 import numpy as np
 
@@ -314,36 +315,85 @@ def dilate_mask(mask, iters):
     return m
 
 
+def edge_falloff_field(seg_uv, size, radius_px):
+    """开放边界 UV 线段 → 距离衰减场(边界=0, ≥radius=1), 乘在高度场上。
+
+    高度沿开放边(卡片边缘)平滑归零防撕缝。场量定义在 UV 域(低模属性),
+    与细分方式/级别无关。逐线段按像素密度采样打点 → 4 邻域 BFS 传播整数
+    距离 → smoothstep(C1) → 2 轮 Jacobi 平滑抹掉整数环带。np.roll 环绕
+    与平铺采样语义一致。seg_uv (E,2,2)。
+    """
+    if seg_uv.shape[0] == 0 or radius_px <= 0:
+        return np.ones((size, size), np.float32)
+    a = seg_uv[:, 0].astype(np.float64) * size
+    b = seg_uv[:, 1].astype(np.float64) * size
+    ln = np.maximum(np.abs(b - a).max(axis=1), 1e-9)
+    n = np.minimum(np.ceil(ln).astype(np.int64) + 1, 4 * size)
+    total = int(n.sum())
+    seg_id = np.repeat(np.arange(seg_uv.shape[0]), n)
+    ofs = np.concatenate([[0], np.cumsum(n)[:-1]])
+    t = (np.arange(total) - ofs[seg_id]) / np.maximum(n[seg_id] - 1, 1)
+    p = a[seg_id] * (1.0 - t[:, None]) + b[seg_id] * t[:, None]
+    xi = np.floor(p[:, 0]).astype(np.int64) % size
+    yi = np.floor(p[:, 1]).astype(np.int64) % size
+    r = int(radius_px)
+    dist = np.full((size, size), r + 1, np.int16)
+    dist[yi, xi] = 0
+    for _ in range(r):
+        m = np.minimum(dist, np.roll(dist, 1, 0) + 1)
+        m = np.minimum(m, np.roll(dist, -1, 0) + 1)
+        m = np.minimum(m, np.roll(dist, 1, 1) + 1)
+        m = np.minimum(m, np.roll(dist, -1, 1) + 1)
+        if np.array_equal(m, dist):
+            break
+        dist = m
+    s = np.clip(dist.astype(np.float32) / np.float32(r + 1), 0.0, 1.0)
+    s = s * s * (3.0 - 2.0 * s)
+    for _ in range(2):
+        s = 0.5 * s + 0.125 * (np.roll(s, 1, 0) + np.roll(s, -1, 0)
+                               + np.roll(s, 1, 1) + np.roll(s, -1, 1))
+    return s
+
+
 # ---------------------------------------------------------------------------
-# Frankot-Chellappa 频域泊松积分
+# Neumann 最小二乘泊松积分(半样本镜像 ≡ DCT)
 # ---------------------------------------------------------------------------
 
-def integrate_height(gx, gy, highpass_wavelength=0.0, smooth_sigma=0.0):
-    """最小二乘可积化: 给定梯度场求高度场 (全局零均值→平地锚定)。
+def integrate_height(gx, gy, smooth_sigma=0.0):
+    """Neumann 最小二乘可积化: 给定梯度场求高度场 (平地锚定)。
 
-    梯度为 dh/du(物体单位/UV), 积分域取 UV 单位正方形(像素间距 1/W, 1/H),
-    返回高度即物体单位的物理高度。O(N logN), 4K 贴图约 1~2s。
-    highpass_wavelength: >0 时抑制波长(UV单位)大于该值的成分(跨岛低频鼓包)。
-    smooth_sigma: >0 时做高斯低通(σ, UV单位), 抑制采样锯齿/噪点。
+    半样本镜像扩展到 2H×2W 后做周期 Frankot-Chellappa: gx 沿 x 反对称/沿 y
+    对称, gy 相反——对称数据的周期最小二乘解自动继承偶对称, 取原象限即
+    Neumann 边界解。消除周期 FFT 的 wrap-around: 斜坡/非周期内容精确还原,
+    岛间不再经图集边界环绕互相泄漏低频(旧高通压泄漏的拐杖随之废除)。
+    梯度为 dh/du(物体单位/UV), 返回物理高度。4K 图瞬时内存 ~1.5GB(complex128)。
+    smooth_sigma: >0 时高斯低通(σ, UV单位), 用作顶点 Nyquist 抗混叠下限。
     """
     h, w = gx.shape
-    wx = (2.0 * np.pi) * np.fft.rfftfreq(w, d=1.0 / w)   # rad / UV单位
-    wy = (2.0 * np.pi) * np.fft.fftfreq(h, d=1.0 / h)
-    gx_f = np.fft.rfft2(gx)
-    gy_f = np.fft.rfft2(gy)
+    gx2 = np.empty((2 * h, 2 * w), np.float32)
+    gy2 = np.empty((2 * h, 2 * w), np.float32)
+    gx2[:h, :w] = gx
+    gx2[:h, w:] = -gx[:, ::-1]
+    gx2[h:] = gx2[:h][::-1]
+    gy2[:h, :w] = gy
+    gy2[:h, w:] = gy[:, ::-1]
+    gy2[h:] = -gy2[:h][::-1]
+    wx = (2.0 * np.pi) * np.fft.rfftfreq(2 * w, d=1.0 / w)   # rad / UV单位
+    wy = (2.0 * np.pi) * np.fft.fftfreq(2 * h, d=1.0 / h)
+    gx_f = np.fft.rfft2(gx2)
+    del gx2
+    gy_f = np.fft.rfft2(gy2)
+    del gy2
     denom = wx[None, :] ** 2 + wy[:, None] ** 2
     denom[0, 0] = 1.0
     hf = (wx[None, :] * gx_f + wy[:, None] * gy_f) * (-1j)
+    del gx_f, gy_f
     hf /= denom
     hf[0, 0] = 0.0
-    if highpass_wavelength > 0.0:
-        kc = (2.0 * np.pi) / highpass_wavelength
-        k2 = (wx[None, :] ** 2 + wy[:, None] ** 2) / (kc * kc)
-        hf *= 1.0 - np.exp(-(k2 * k2))   # 4阶高斯高通, 拐点较陡
     if smooth_sigma > 0.0:
         k_sq = wx[None, :] ** 2 + wy[:, None] ** 2
         hf *= np.exp(-0.5 * smooth_sigma * smooth_sigma * k_sq)
-    out = np.fft.irfft2(hf, s=(h, w)).astype(np.float32)
+    out = np.fft.irfft2(hf, s=(2 * h, 2 * w))[:h, :w].astype(np.float32)
     # 基准面锚定: 平坦区(零梯度, 含未烘焙背景)应为 0 高度
     flat = (gx == 0.0) & (gy == 0.0)
     if flat.mean() > 0.01:
@@ -664,6 +714,31 @@ def _selftest():
     peak = hb.max()
     print(f"[锚定] 平地电平 = {corner_lvl:+.2e}  峰值 = {peak:.4f} (真值 0.05)")
     assert abs(corner_lvl) < 1e-3 and abs(peak - 0.05) < 0.005
+
+    # ---- Neumann: 非周期斜坡精确还原(周期 FFT 因 wrap-around 必然失败) ----
+    ramp_g = np.full((64, 64), 0.7, np.float32)
+    zero_g = np.zeros_like(ramp_g)
+    uu64 = (np.arange(64, dtype=np.float64) + 0.5) / 64.0
+    hx = integrate_height(ramp_g, zero_g).astype(np.float64)
+    ex = hx - 0.7 * uu64[None, :]
+    ex -= ex.mean()
+    rms_ref = np.sqrt(np.mean((0.7 * (uu64 - 0.5)) ** 2))
+    rel_x = np.sqrt(np.mean(ex ** 2)) / rms_ref
+    hy = integrate_height(zero_g, ramp_g).astype(np.float64)
+    ey = hy - 0.7 * uu64[:, None]
+    ey -= ey.mean()
+    rel_y = np.sqrt(np.mean(ey ** 2)) / rms_ref
+    print(f"[Neumann斜坡] x向相对RMS = {rel_x:.2e}  y向 = {rel_y:.2e}")
+    assert rel_x < 2e-2 and rel_y < 2e-2, "镜像 Neumann 积分未能还原非周期斜坡"
+
+    # ---- 边缘衰减场 ----
+    seg = np.array([[[0.0, 0.5], [1.0, 0.5]]], np.float32)   # 横贯 v=0.5 的开放边
+    fall = edge_falloff_field(seg, 64, 8)
+    assert fall[32].max() < 0.2, "边界行未压向 0"
+    assert fall[0].min() > 0.8, "远离边界处应≈1"
+    assert np.all(np.diff(fall[32:41, 10]) >= -1e-6), "衰减带非单调"
+    assert edge_falloff_field(np.zeros((0, 2, 2), np.float32), 32, 8).min() == 1.0
+    print("[边缘衰减] 距离场/单调性校验通过")
 
     # ---- UV 岛并查集 ----
     loop_uv = np.array([

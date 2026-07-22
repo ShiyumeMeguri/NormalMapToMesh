@@ -25,11 +25,11 @@ class NMTMSettings(bpy.types.PropertyGroup):
         description="1.0 = 按法线坡度积分出的物理高度(物体空间单位, 高频细节自动"
                     "获得与波长匹配的小高度)。完全平贴严格零位移(无整体膨胀), "
                     "凹凸随倾斜方向正负; 负值整体反向")
-    edge_smooth_iters: IntProperty(
-        name="边缘/位移平滑", default=8, min=0, max=64,
-        description="位移向量场的图拉普拉斯平滑迭代次数: 开放边界(卡片边缘)顶点"
-                    "始终锁死为零位移(防边缘错位撕缝), 平滑让位移向边缘平滑衰减"
-                    "并去除高频斑点; 0=只锁边不平滑")
+    edge_falloff_px: IntProperty(
+        name="边缘衰减 (px)", default=8, min=0, max=128,
+        description="高度场向开放边界(卡片边缘)的 smoothstep 距离衰减半径"
+                    "(贴图像素): 场量属于低模 UV 域, 与细分级别无关; 边界顶点"
+                    "始终硬锁零位移防撕缝; 0=只硬锁边")
     force_bake: BoolProperty(
         name="强制烘焙路径", default=False,
         description="跳过直算前端, 强制走 Cycles EMIT 烘焙(兼容任意材质节点网络; "
@@ -41,15 +41,6 @@ class NMTMSettings(bpy.types.PropertyGroup):
     slope_limit: FloatProperty(
         name="坡度上限", default=10.0, min=0.0, soft_max=20.0, step=10, precision=1,
         description="坡度(tanθ)限幅, 压制烘焙噪声/压缩伪影导致的尖刺(0=关)")
-    subdiv_mode: EnumProperty(
-        name="细分方式",
-        items=(('CATMULL_CLARK', "平滑 (Catmull-Clark)",
-                "全局迭代平均细分, 收敛到 C2 光滑极限曲面(默认, 圆润有机形体); "
-                "开放边界的收缩漂移会用 SIMPLE 对照细分自动校正回基面边缘"
-                "(边缘钉死不产生缝隙), 首次构建多一次对照细分开销"),
-               ('SIMPLE', "Simple (保形)", "保持低模形状不做任何平滑, 细节与烘焙面完全对位"),
-               ('LINEAR', "Linear", "线性细分")),
-        default='CATMULL_CLARK')
     auto_levels: BoolProperty(
         name="自动级别", default=True,
         description="按工作分辨率(源贴图原生) × UV 占用率自动匹配 ≈1 四边形/texel")
@@ -87,8 +78,7 @@ class NMTM_PT_panel(bpy.types.Panel):
 
         box = layout.box()
         box.label(text="选项", icon='PREFERENCES')
-        box.prop(s, "subdiv_mode", text="细分")
-        box.prop(s, "edge_smooth_iters")
+        box.prop(s, "edge_falloff_px")
         box.prop(s, "deadzone_lsb")
         box.prop(s, "slope_limit")
         row = box.row()
