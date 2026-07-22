@@ -66,19 +66,28 @@ def decode_unit_normal(rgb):
 # 高度梯度装配(零约定猜测)
 # ---------------------------------------------------------------------------
 
-def height_gradients(rgb_detail, rgb_base, pos, min_cos=0.2):
+def height_gradients(rgb_detail, rgb_base, pos, min_cos=0.2,
+                     deadzone=0.0, slope_limit=0.0):
     """三张烘焙图 → UV 域高度梯度 (gx=dh/du, gy=dh/dv, 物体单位) + 有效权重。
 
     g = n0 − n1/(n1·n0): 高度场表面梯度的 3D 形式(切平面向量, |g| = tanθ);
     ∂P/∂u、∂P/∂v 用位置图中心差分——镜像岛的 U 轴自动反向, 混合手性零处理。
     dh/du = g·∂P/∂u 直接携带每 texel 的真实世界尺度(逐岛密度差异自动正确)。
     岛间沟槽处两侧 margin 相遇会产生巨大 |∂P| 假差分, 用稳健中位数阈值剔除。
+    deadzone/slope_limit 语义同 gradients_from_tangent_frames(按 |g|=tanθ 幅值近似)。
     """
     n1, w1 = decode_unit_normal(rgb_detail)
     n0, w0 = decode_unit_normal(rgb_base)
     dot = np.einsum('...i,...i->...', n1, n0)
     w = w1 * w0 * (dot > min_cos).astype(np.float32)
     g = n0 - n1 / np.maximum(dot, min_cos)[..., None]
+    if deadzone > 0.0 or slope_limit > 0.0:
+        gm = np.sqrt(np.einsum('...i,...i->...', g, g))
+        if deadzone > 0.0:
+            g = np.where((gm <= deadzone)[..., None], 0.0, g)
+        if slope_limit > 0.0:
+            scale = np.minimum(1.0, slope_limit / np.maximum(gm, 1e-12))
+            g = g * scale[..., None]
 
     hgt, wid = dot.shape
     pu = (np.roll(pos, -1, axis=1) - np.roll(pos, 1, axis=1)) * (wid / 2.0)
@@ -201,13 +210,17 @@ def dilate_grid(grid, mask, iters):
 
 
 def gradients_from_tangent_frames(t_xyz, tan_grid, nrm_grid, sign_grid,
-                                  pu_grid, pv_grid, mask, min_cos=0.2):
+                                  pu_grid, pv_grid, mask, min_cos=0.2,
+                                  deadzone=0.0, slope_limit=0.0):
     """切线空间法线网格 + 光栅化切线帧 → UV 高度梯度(免烘焙直算)。
 
     与烘焙路径同一代数(逐 texel): n1 ∝ T·tx + B·ty + N·tz, B = sign·(N×T),
     g = n0 − n1/max(n1·n0, min_cos) 化简为 g = −(T·tx + B·ty)/max(tz, min_cos·|t|),
     dh/du = g·∂P/∂u, dh/dv = g·∂P/∂v (∂P 为逐三角形解析常量, 无沟槽假差分)。
     |t| 异常(未覆盖/坏像素)或 cos ≤ min_cos 的 texel 权重归零。
+    deadzone: |tx|/|ty| ≤ 该值(归一化)视为纯平——8bit 量化的 ±1 LSB 噪声
+    经泊松积分会放大成低频起伏/表面斑点, 死区让平坦区严格为平。
+    slope_limit: 坡度幅值(tanθ)限幅, 压制烘焙噪声/压缩伪影的尖刺。
     """
     tx = t_xyz[..., 0]
     ty = t_xyz[..., 1]
@@ -224,6 +237,15 @@ def gradients_from_tangent_frames(t_xyz, tan_grid, nrm_grid, sign_grid,
     denom = np.maximum(denom, 1e-12)
     fx = tx / denom
     fy = ty / denom
+    if deadzone > 0.0:
+        lm = np.maximum(ln, 1e-12)
+        fx = np.where(np.abs(tx) <= deadzone * lm, 0.0, fx)
+        fy = np.where(np.abs(ty) <= deadzone * lm, 0.0, fy)
+    if slope_limit > 0.0:
+        mag = np.hypot(fx, fy)
+        scale = np.minimum(1.0, slope_limit / np.maximum(mag, 1e-12))
+        fx = fx * scale
+        fy = fy * scale
     gvx = -(tan_grid[..., 0] * fx + bx * fy)
     gvy = -(tan_grid[..., 1] * fx + by * fy)
     gvz = -(tan_grid[..., 2] * fx + bz * fy)

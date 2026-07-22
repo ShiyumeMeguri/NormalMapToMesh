@@ -40,6 +40,18 @@ class NMTMSettings(bpy.types.PropertyGroup):
         name="强制烘焙路径", default=False,
         description="跳过直算前端, 强制走 Cycles EMIT 烘焙(兼容任意材质节点网络; "
                     "默认关——直算不支持的节点会自动回退烘焙)")
+    smooth_px: FloatProperty(
+        name="表面平滑 (px)", default=2.0, min=0.0, soft_max=16.0, step=10, precision=1,
+        description="高度场高斯预滤 σ(像素): 压掉 8bit 量化噪声与贴图→顶点欠采样混叠"
+                    "造成的表面斑点; 细节波长大于约 4σ 的保留。要更玻璃的表面调大"
+                    "(4~6), 0=关")
+    deadzone_lsb: FloatProperty(
+        name="平整死区 (LSB)", default=1.0, min=0.0, soft_max=4.0, step=10, precision=1,
+        description="法线 XY 分量低于该值(8bit 台阶数)视为纯平——量化噪声经积分会"
+                    "放大成低频起伏, 死区保证平坦区严格为平(0=关)")
+    slope_limit: FloatProperty(
+        name="坡度上限", default=10.0, min=0.0, soft_max=20.0, step=10, precision=1,
+        description="坡度(tanθ)限幅, 压制烘焙噪声/压缩伪影导致的尖刺(0=关)")
     subdiv_mode: EnumProperty(
         name="细分方式",
         items=(('SIMPLE', "Simple (保形)", "保持低模形状, 细节与烘焙面完全对位"),
@@ -85,8 +97,11 @@ class NMTM_PT_panel(bpy.types.Panel):
 
         box = layout.box()
         box.label(text="选项", icon='PREFERENCES')
-        box.prop(s, "bake_size", text="烘焙")
+        box.prop(s, "bake_size", text="分辨率")
+        box.prop(s, "smooth_px")
         box.prop(s, "edge_smooth_iters")
+        box.prop(s, "deadzone_lsb")
+        box.prop(s, "slope_limit")
         box.prop(s, "subdiv_mode", text="细分")
         row = box.row()
         row.prop(s, "auto_levels")

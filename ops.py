@@ -358,7 +358,8 @@ def _mesh_fingerprint(me, loop_uv):
     return (me.name_full, len(me.vertices), len(me.polygons), len(me.loops), fp)
 
 
-def _gradients_direct(obj, me, source, image, size, loop_uv, loop_vert):
+def _gradients_direct(obj, me, source, image, size, loop_uv, loop_vert,
+                      deadzone=0.0, slope_limit=0.0):
     """免烘焙直算: mikktspace 切线帧 + 逐三角形解析 ∂P → UV 高度梯度。
 
     与烘焙路径同一代数; 镜像/混合手性由逐 loop bitangent_sign 精确携带,
@@ -440,7 +441,8 @@ def _gradients_direct(obj, me, source, image, size, loop_uv, loop_vert):
     # 梯度只取真实 UV 覆盖区(mask0): 外扩 margin 的复制内容会虚增积分能量
     gx, gy, _ = core.gradients_from_tangent_frames(
         t_map, grid[..., 0:3], grid[..., 3:6], grid[..., 6],
-        grid[..., 7:10], grid[..., 10:13], mask0)
+        grid[..., 7:10], grid[..., 10:13], mask0,
+        deadzone=deadzone, slope_limit=slope_limit)
 
     # 采样连续性只需要法线通道外扩(岛边界 bilinear 不吃到无效 texel)
     n0grid, mask1 = core.dilate_grid(grid[..., 3:6], mask0, BAKE_MARGIN)
@@ -451,10 +453,12 @@ def _gradients_direct(obj, me, source, image, size, loop_uv, loop_vert):
     return gx, gy, wmap, n0_enc.astype(np.float32)
 
 
-def _gradients_cached(context, obj, me, source, image, size, loop_uv, loop_vert, force_bake):
+def _gradients_cached(context, obj, me, source, image, size, loop_uv, loop_vert,
+                      force_bake, deadzone, slope_limit):
     mats = tuple(s.material.name_full if s.material else '' for s in obj.material_slots)
     key = (_mesh_fingerprint(me, loop_uv), mats, source,
-           image.name_full if image is not None else '', int(size), bool(force_bake))
+           image.name_full if image is not None else '', int(size), bool(force_bake),
+           round(float(deadzone), 6), round(float(slope_limit), 6))
     got = _grad_cache.get(key)
     if got is not None:
         return got
@@ -462,13 +466,15 @@ def _gradients_cached(context, obj, me, source, image, size, loop_uv, loop_vert,
     result = None
     if not force_bake:
         try:
-            result = _gradients_direct(obj, me, source, image, size, loop_uv, loop_vert)
+            result = _gradients_direct(obj, me, source, image, size, loop_uv, loop_vert,
+                                       deadzone=deadzone, slope_limit=slope_limit)
             print("[NormalMapToMesh] 前端: 直算(免烘焙)")
         except _NodeEvalUnsupported as e:
             print(f"[NormalMapToMesh] 直算不支持({e}), 回退 Cycles 烘焙")
     if result is None:
         rgb_detail, rgb_base, pos_map = _bake_triple(context, obj, source, image, size, loop_uv)
-        gx, gy, wmap = core.height_gradients(rgb_detail, rgb_base, pos_map)
+        gx, gy, wmap = core.height_gradients(rgb_detail, rgb_base, pos_map,
+                                             deadzone=deadzone, slope_limit=slope_limit)
         result = (gx, gy, wmap, rgb_base)
     _cache_put(_grad_cache, key, result)
     return result
@@ -825,9 +831,13 @@ def _build_inner(context, obj, s, report, t0):
     bake_size = int(s.bake_size)
     gx, gy, wmap, n0_enc = _gradients_cached(
         context, obj, me, source, s.image if source == 'IMAGE' else None,
-        bake_size, loop_uv, loop_vert, bool(s.force_bake))
+        bake_size, loop_uv, loop_vert, bool(s.force_bake),
+        s.deadzone_lsb / 127.5, s.slope_limit)
 
-    field = core.integrate_height(gx, gy)
+    # 高斯预滤(σ=像素): 压掉量化/欠采样噪声——2048 贴图对百万级顶点是欠采样,
+    # texel 级抖动会直接刻成表面斑点; 细节波长 ≳4σ 的保留
+    smooth_sigma = (s.smooth_px / bake_size) if s.smooth_px > 0 else 0.0
+    field = core.integrate_height(gx, gy, 0.0, smooth_sigma)
     if not (wmap > 0).any():
         raise RuntimeError("梯度全部无效(UV 未覆盖/法线异常), 高度重建失败")
     print(f"[NormalMapToMesh] 梯度有效率 {wmap.mean():.1%} | "
