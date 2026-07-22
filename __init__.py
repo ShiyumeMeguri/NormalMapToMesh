@@ -2,11 +2,12 @@
 bl_info = {
     "name": "Normal Map To Mesh (法线→多级精度高模)",
     "author": "Ruri",
-    "version": (1, 2, 0),
+    "version": (2, 0, 0),
     "blender": (4, 2, 0),
     "location": "3D视图 > 侧栏(N) > Ruri",
-    "description": "把匹配当前网格 UV 的法线贴图经 FFT 泊松积分重建为 Multires 高模细节, "
-                   "一键自动细分+位移+写回, 支持强度缩放与 UV 岛接缝对齐",
+    "description": "把法线贴图经 Cycles 物体空间法线烘焙 + Displace(RGB→XYZ) 同款向量位移 "
+                   "重建为 Multires 高模细节, 一键自动细分+位移+写回; 切线基/绿通道约定/"
+                   "镜像 UV 岛全部由渲染器按材质真实节点求值",
     "category": "Mesh",
 }
 
