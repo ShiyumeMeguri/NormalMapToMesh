@@ -3,17 +3,20 @@
 # SIMPLE 细分求值、numpy 位移、multires_reshape 写回。
 #
 # v6 不变式: 一切场量只由低模 + 法线贴图决定, 细分只是采样密度——任何级别
-# 都输出同一张曲面(shader 逐像素求值的几何化), 位移管线不读细分网格自身的
-# 任何属性(离散角法线/CC 坐标皆禁)。
+# 都输出同一张曲面(基面 = 低模的确定函数), 位移管线不读细分网格自身属性。
 #   1. 直算前端: mikktspace 切线帧(calc_tangents, 与渲染器同源)+逐三角形解析
 #      ∂P/∂u,∂P/∂v 光栅化到 UV 网格; 材质法线链用 numpy 节点求值器直接算,
 #      切线空间法线图 + 切线帧 → 高度梯度。不支持的节点/网格回退 EMIT 三图烘焙。
 #   2. 镜像 Neumann 泊松积分 → 物理高度场(平贴严格 0) → 开放边界距离衰减。
 #   3. Multires 建层只为数据结构(隐藏态跑 subdivide; reshape 完整覆写 MDISPS);
 #      重建时层数匹配则整段跳过。
-#   4. 细分基面 = SIMPLE Subsurf 求值副本(拓扑与 multires 逐位一致, 实测),
-#      顶点严格落在低模面上; 低模平滑角法线以 corner 属性随细分线性插值——
-#      位移方向即 shader 的逐像素插值法线场, 面内 C∞。
+#   4. 细分基面 = 岛界折痕锁定的 Catmull-Clark 极限曲面(Subsurf 求值副本,
+#      use_limit_surface: 任何级别都是同一极限曲面的嵌套采样): 低模粗曲率由
+#      细分平滑(法线图只携带高频细节), 而所有 UV 岛边界边 crease=1 + 岛界顶点
+#      vertex crease=1——折痕链逐级取中点且端点钉死, 边界折线被精确锁在原位
+#      (CC 默认把边界链平滑成 B 样条曲线, 即"边缘软化"/卡片缝隙的根源)。
+#      UV 与低模角法线(NMTM_N0 corner 属性)保持线性插值(uv_smooth=NONE),
+#      位移方向即 shader 的逐像素插值法线场, 采样对位不随细分漂移。
 #   5. 采样高度(B 样条 C2) → 逐岛去趋势/缝合 → 边界硬锁 → 位移 → reshape 写回。
 #
 # 重复点"应用"= 从基面重建(幂等), 改倍数即所见即所得(全缓存命中, 只剩写回)。
@@ -773,30 +776,95 @@ def _bake_triple(context, obj, source, image, bake_size, loop_uv):
 
 
 # ---------------------------------------------------------------------------
-# SIMPLE 细分求值(拓扑与 multires 逐位一致, 实测)
+# 岛界折痕锁定的 Catmull-Clark 极限曲面求值(拓扑与 multires 逐位一致, 实测)
 # ---------------------------------------------------------------------------
 
-def _subsurf_eval_mesh(context, obj, level):
-    """网格副本 + SIMPLE Subsurf 求值 → 新 Mesh 数据块(调用方负责删除)。
+def _island_border_edges(me, loop_uv, loop_vert, labels, loop_total):
+    """UV 岛边界边集合 + 其端点集合(折痕锁定目标)。
+
+    边界 = 开放边/非流形边、两侧面属不同岛的边、两侧 UV 不连续的接缝边
+    (量化口径与 face_islands 一致)。返回 (edge_bool[E], vert_bool[V])。
+    """
+    e_count = len(me.edges)
+    l_count = len(me.loops)
+    le = np.empty(l_count, np.int32)
+    me.loops.foreach_get("edge_index", le)
+    ls = np.empty(len(me.polygons), np.int64)
+    me.polygons.foreach_get("loop_start", ls)
+    lt = loop_total.astype(np.int64)
+    nxt = np.arange(l_count, dtype=np.int64) + 1
+    nxt[ls + lt - 1] = ls
+    poly_of_loop = np.repeat(np.arange(len(me.polygons), dtype=np.int64), lt)
+
+    counts = np.bincount(le, minlength=e_count)
+    border = counts != 2                       # 开放边/非流形边一律锁
+    two_edges = np.flatnonzero(counts == 2)
+    if two_edges.size:
+        order = np.argsort(le, kind='stable')
+        first = np.searchsorted(le[order], two_edges, side='left')
+        l1 = order[first].astype(np.int64)
+        l2 = order[first + 1].astype(np.int64)
+        diff_isl = labels[poly_of_loop[l1]] != labels[poly_of_loop[l2]]
+        quv = np.round(loop_uv.astype(np.float64) * 65536.0).astype(np.int64)
+        lv = loop_vert.astype(np.int64)
+        opp = lv[l2] != lv[l1]                 # 对向绕行(流形正常态)
+        c2a = np.where(opp, nxt[l2], l2)       # 对侧面上与 l1 同顶点的角
+        c2b = np.where(opp, l2, nxt[l2])
+        seam = ((quv[l1] != quv[c2a]).any(axis=1)
+                | (quv[nxt[l1]] != quv[c2b]).any(axis=1))
+        border[two_edges[diff_isl | seam]] = True
+
+    ev = np.empty(e_count * 2, np.int32)
+    me.edges.foreach_get("vertices", ev)
+    vert_pin = np.zeros(len(me.vertices), bool)
+    vert_pin[ev.reshape(-1, 2)[border].ravel()] = True
+    return border, vert_pin
+
+
+def _subsurf_eval_mesh(context, obj, level, border_edges, border_verts):
+    """网格副本 + 折痕锁定 CC Subsurf 极限求值 → 新 Mesh(调用方负责删除)。
 
     无算子、无选择/撤销依赖, 也天然不受 Mesh 里已有 MDISPS 影响(Subsurf 忽略之)。
-    顶点严格落在低模面上(线性细分), UV 同为线性插值——与 shader 的重心插值同构。
-    副本上先把低模平滑角法线写成 corner 属性 NMTM_N0: SIMPLE 细分对 generic
-    属性做纯线性插值, 求值网格即携带连续法线场(位移方向), 全程零高模数据。
+    岛界边 crease=1 + 岛界顶点 vertex crease=1: 折痕链逐级取线性中点、原顶点
+    钉死——边界折线精确保持原位(CC 默认把边界链平滑成 B 样条曲线 = 边缘软化);
+    内部收敛到 C2 极限曲面, use_limit_surface 使任何级别都是同一曲面的嵌套采样。
+    副本上把低模平滑角法线写成 corner 属性 NMTM_N0, uv_smooth=NONE 保证 UV 与
+    该属性均为纯线性插值(shader 重心插值同构), 全程零高模数据。与用户已有
+    折痕取 max 合并, 原网格不动。
     """
     me2 = obj.data.copy()
     nrm = np.empty(len(me2.loops) * 3, np.float32)
     me2.corner_normals.foreach_get("vector", nrm)
     attr = me2.attributes.new("NMTM_N0", 'FLOAT_VECTOR', 'CORNER')
     attr.data.foreach_set("vector", nrm)
+
+    ec = me2.attributes.get("crease_edge")
+    if ec is None or ec.domain != 'EDGE':
+        ec = me2.attributes.new("crease_edge", 'FLOAT', 'EDGE')
+        cur_e = np.zeros(len(me2.edges), np.float32)
+    else:
+        cur_e = np.empty(len(me2.edges), np.float32)
+        ec.data.foreach_get("value", cur_e)
+    ec.data.foreach_set("value", np.maximum(cur_e, border_edges.astype(np.float32)))
+    vc = me2.attributes.get("crease_vert")
+    if vc is None or vc.domain != 'POINT':
+        vc = me2.attributes.new("crease_vert", 'FLOAT', 'POINT')
+        cur_v = np.zeros(len(me2.vertices), np.float32)
+    else:
+        cur_v = np.empty(len(me2.vertices), np.float32)
+        vc.data.foreach_get("value", cur_v)
+    vc.data.foreach_set("value", np.maximum(cur_v, border_verts.astype(np.float32)))
+
     tmp_o = bpy.data.objects.new("NMTM_subd_tmp", me2)
     context.scene.collection.objects.link(tmp_o)
     try:
         mod = tmp_o.modifiers.new("NMTM_subd", 'SUBSURF')
-        mod.subdivision_type = 'SIMPLE'
+        mod.subdivision_type = 'CATMULL_CLARK'
         mod.levels = level
         mod.render_levels = level
         mod.quality = 4                  # multires 默认
+        mod.use_limit_surface = True
+        mod.use_creases = True
         mod.uv_smooth = 'NONE'
         mod.boundary_smooth = 'ALL'
         dg = context.evaluated_depsgraph_get()
@@ -920,6 +988,13 @@ def _build_inner(context, obj, s, report, t0):
 
     fill = _uv_fill(me, loop_uv)
 
+    # 岛标签 + 岛界折痕集合(基面属性, 细分求值与岛处理共用)
+    loop_total = np.empty(len(me.polygons), np.int32)
+    me.polygons.foreach_get("loop_total", loop_total)
+    labels, n_islands = _get_island_labels(me, loop_vert, loop_uv, loop_total)
+    border_edges, border_verts = _island_border_edges(me, loop_uv, loop_vert,
+                                                     labels, loop_total)
+
     # ---- Multires 修改器 ----
     mod = _find_multires(obj)
     owned = bool(obj.get("nmtm_owned"))
@@ -973,7 +1048,7 @@ def _build_inner(context, obj, s, report, t0):
                 mod.sculpt_levels = 0
                 bpy.ops.object.multires_higher_levels_delete(modifier=mod.name)
             for _ in range(level):
-                bpy.ops.object.multires_subdivide(modifier=mod.name, mode='SIMPLE')
+                bpy.ops.object.multires_subdivide(modifier=mod.name, mode='CATMULL_CLARK')
         finally:
             mod.show_viewport = True
     mod.levels = level
@@ -983,7 +1058,8 @@ def _build_inner(context, obj, s, report, t0):
         mod.uv_smooth = 'NONE'          # 最终对象 UV 与采样时的线性插值一致
     t_subdiv = time.perf_counter()
 
-    # ---- 细分基面: SIMPLE Subsurf 求值副本(拓扑与 multires 逐位一致) ----
+    # ---- 细分基面: 岛界折痕锁定 CC 极限曲面(Subsurf 求值副本, 拓扑与 multires
+    #      逐位一致) ----
     # 临时关掉其它修改器, 保证 reshape 空间纯净(骨架变形不得混入目标面)
     # 注意: bpy RNA 包装对象不能用 `is` 比较(每次访问都是新包装), 按类型过滤
     saved_vis = [(m, m.show_viewport) for m in obj.modifiers if m.type != 'MULTIRES']
@@ -994,7 +1070,7 @@ def _build_inner(context, obj, s, report, t0):
     try:
         mod.show_viewport = False
         try:
-            tmp_me = _subsurf_eval_mesh(context, obj, level)
+            tmp_me = _subsurf_eval_mesh(context, obj, level, border_edges, border_verts)
         finally:
             mod.show_viewport = True
         t_eval = time.perf_counter()
@@ -1014,10 +1090,7 @@ def _build_inner(context, obj, s, report, t0):
         h_loop = s2[:, 0].astype(np.float32)
         w_loop = (s2[:, 1] > 0.5).astype(np.float32)
 
-        # 基面拓扑映射(细分面按基面连续分块) → 岛标签 + 逐 loop 基面号
-        loop_total = np.empty(len(me.polygons), np.int32)
-        me.polygons.foreach_get("loop_total", loop_total)
-        labels, n_islands = _get_island_labels(me, loop_vert, loop_uv, loop_total)
+        # 基面拓扑映射: 细分面按基面连续分块 → 逐 loop 岛标签
         per_face = loop_total.astype(np.int64) * (4 ** (level - 1))
         island_of_loop2 = np.repeat(np.repeat(labels, per_face), 4)
         if island_of_loop2.shape[0] != h_loop.shape[0]:
