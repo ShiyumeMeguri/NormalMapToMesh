@@ -28,11 +28,11 @@ from . import core
 MAX_LEVELS = 9
 BAKE_MARGIN = 16
 BAKE_SAMPLES = 1   # EMIT 烘焙无噪声, 1 采样足够(回退路径)
+PHONG_ALPHA = 0.75   # Phong Tessellation 鼓形系数(Boubekeur-Alexa 论文最优值)
 
 # 运行期缓存(只认网格/材质"身份", 不追踪材质节点内容变化)
 _grad_cache = {}     # 前端结果: (gx, gy, wmap, n0_enc)
 _island_cache = {}
-_simple_cache = {}   # SIMPLE 对照细分坐标
 
 
 def _cache_put(cache, key, val, cap=2):
@@ -45,7 +45,6 @@ def _cache_put(cache, key, val, cap=2):
 def clear_caches():
     _grad_cache.clear()
     _island_cache.clear()
-    _simple_cache.clear()
 
 
 # ---------------------------------------------------------------------------
@@ -755,35 +754,13 @@ def _subsurf_eval_mesh(context, obj, level, sub_type, uv_smooth):
     return out
 
 
-def _eval_simple_coords(context, obj, level):
-    """同级 SIMPLE(线性)细分坐标 (V,3) —— CC 边界校正的目标位置。按指纹缓存。"""
-    me = obj.data
-    key = (me.name_full, len(me.vertices), len(me.loops), int(level), 'simple')
-    got = _simple_cache.get(key)
-    if got is not None:
-        return got
-    tm = _subsurf_eval_mesh(context, obj, level, 'SIMPLE', 'NONE')
-    try:
-        coords = _read_vert_cos(tm).copy()
-    finally:
-        bpy.data.meshes.remove(tm)
-    _cache_put(_simple_cache, key, coords)
-    return coords
+def _phong_basis_for_loops(me, loop_uv, uv2, base_face_of_loop2):
+    """shader 等价插值基: 逐细分 loop 在其基面的扇形三角化里按 UV 反解重心坐标。
 
-
-def _phong_normals_for_loops(me, loop_uv, uv2, base_face_of_loop2, fallback_nrm):
-    """shader 等价法线场: 逐细分 loop 在其基面的扇形三角化里按 UV 重心插值
-    基面平滑角法线——面内解析光滑(Phong), 与渲染器逐像素插值同构。
-
-    细分网格自己重算的角法线是离散近似(SIMPLE 下面内恒为面法线, 逐基面跳变),
-    位移方向用它会把离散噪声刻进表面; 插值基面法线才是"SDF 场式"的光滑求值。
-    UV 退化/数值失败的 loop 回退 fallback_nrm(细分网格角法线)。
+    返回 (idx3 (N2,3) 基面 loop 号, w3 (N2,3) 权重, ok (N2,) 有效掩码)。
+    由此可对基面的任何逐角属性(平滑法线/位置)做与渲染器逐像素插值同构的
+    解析求值——面内 C∞, 跨面 C0, 无任何离散网格粒度。UV 退化面 ok=False。
     """
-    n_base = len(me.loops)
-    nrm = np.empty(n_base * 3, np.float32)
-    me.corner_normals.foreach_get("vector", nrm)
-    nrm = nrm.reshape(-1, 3).astype(np.float64)
-
     loop_start = np.empty(len(me.polygons), np.int64)
     me.polygons.foreach_get("loop_start", loop_start)
     loop_total = np.empty(len(me.polygons), np.int64)
@@ -793,7 +770,8 @@ def _phong_normals_for_loops(me, loop_uv, uv2, base_face_of_loop2, fallback_nrm)
     ls = loop_start[f]
     lt = loop_total[f]
     n2 = uv2.shape[0]
-    out = np.zeros((n2, 3), np.float64)
+    idx3 = np.zeros((n2, 3), np.int64)
+    w3 = np.zeros((n2, 3), np.float32)
     found = np.zeros(n2, bool)
     uv = loop_uv.astype(np.float64)
     p = uv2.astype(np.float64)
@@ -823,19 +801,15 @@ def _phong_normals_for_loops(me, loop_uv, uv2, base_face_of_loop2, fallback_nrm)
         if not inside.any():
             continue
         sel = act[inside]
-        w0 = np.clip(l0[inside], 0.0, 1.0)
-        w1 = np.clip(l1[inside], 0.0, 1.0)
-        w2 = np.clip(l2[inside], 0.0, 1.0)
-        vec = (nrm[i0[inside]] * w0[:, None] + nrm[i1[inside]] * w1[:, None]
-               + nrm[i2[inside]] * w2[:, None])
-        out[sel] = vec
+        idx3[sel, 0] = i0[inside]
+        idx3[sel, 1] = i1[inside]
+        idx3[sel, 2] = i2[inside]
+        w = np.stack([np.clip(l0[inside], 0.0, 1.0),
+                      np.clip(l1[inside], 0.0, 1.0),
+                      np.clip(l2[inside], 0.0, 1.0)], axis=1)
+        w3[sel] = (w / np.maximum(w.sum(axis=1, keepdims=True), 1e-12)).astype(np.float32)
         found[sel] = True
-    ln = np.linalg.norm(out, axis=1)
-    bad = (~found) | (ln < 1e-6)
-    if bad.any():
-        out[bad] = fallback_nrm[bad]
-        ln = np.linalg.norm(out, axis=1)
-    return (out / np.maximum(ln, 1e-12)[:, None]).astype(np.float32)
+    return idx3, w3, found
 
 
 def _get_island_labels(me, loop_vert, loop_uv, loop_total):
@@ -968,7 +942,7 @@ def _build_inner(context, obj, s, report, t0):
                 mod.sculpt_levels = 0
                 bpy.ops.object.multires_higher_levels_delete(modifier=mod.name)
             for _ in range(level):
-                bpy.ops.object.multires_subdivide(modifier=mod.name, mode=s.subdiv_mode)
+                bpy.ops.object.multires_subdivide(modifier=mod.name, mode='SIMPLE')
         finally:
             mod.show_viewport = True
     mod.levels = level
@@ -976,17 +950,9 @@ def _build_inner(context, obj, s, report, t0):
     mod.render_levels = level
     t_subdiv = time.perf_counter()
 
-    # ---- CC 边界校正的对照细分(Subsurf 线性, 即精确解; 按指纹缓存) ----
-    coords_simple = None
-    if s.subdiv_mode == 'CATMULL_CLARK':
-        mod.show_viewport = False
-        try:
-            coords_simple = _eval_simple_coords(context, obj, level)
-        finally:
-            mod.show_viewport = True
-    t_simple = time.perf_counter()
-
-    # ---- 细分基面: Subsurf 求值副本(拓扑与 multires 逐位一致) ----
+    # ---- 细分基面: Subsurf SIMPLE(线性)求值副本(拓扑与 multires 逐位一致) ----
+    # 曲面平滑不再来自细分模式——线性基面 + Phong Tessellation 解析鼓形
+    # (shader 平滑法线暗示曲面的几何化), 见下方消费段。
     # 临时关掉其它修改器, 保证 reshape 空间纯净(骨架变形不得混入目标面)
     # 注意: bpy RNA 包装对象不能用 `is` 比较(每次访问都是新包装), 按类型过滤
     saved_vis = [(m, m.show_viewport) for m in obj.modifiers if m.type != 'MULTIRES']
@@ -997,9 +963,7 @@ def _build_inner(context, obj, s, report, t0):
     try:
         mod.show_viewport = False
         try:
-            sub_type = 'CATMULL_CLARK' if s.subdiv_mode == 'CATMULL_CLARK' else 'SIMPLE'
-            uv_sm = 'PRESERVE_BOUNDARIES' if sub_type == 'CATMULL_CLARK' else 'NONE'
-            tmp_me = _subsurf_eval_mesh(context, obj, level, sub_type, uv_sm)
+            tmp_me = _subsurf_eval_mesh(context, obj, level, 'SIMPLE', 'NONE')
         finally:
             mod.show_viewport = True
         t_eval = time.perf_counter()
@@ -1031,12 +995,38 @@ def _build_inner(context, obj, s, report, t0):
         base_face_of_loop2 = np.repeat(
             np.repeat(np.arange(len(me.polygons), dtype=np.int64), per_face), 4)
 
-        # 位移方向 = 基面平滑角法线在表面插值位置的 Phong 插值(shader 等价的
-        # 解析光滑法线场)——细分网格重算的角法线是离散近似, 会刻入面级噪声
+        # shader 等价插值基(基面扇形三角重心), 由此解析求值两样东西:
+        # ① Phong 法线场(位移方向)——面内 C∞, 与渲染器逐像素插值同构;
+        # ② Phong Tessellation 曲面鼓形——渲染平滑法线所暗示曲面的几何化:
+        #    π_i(p) = p − ((p−P_i)·N_i)N_i, p* = Σ w_i·π_i(p), 鼓形 = α(p*−p)。
+        # 细分网格重算的角法线/细分曲面都是离散近似, 不再参与任何计算。
+        idx3, w3, ph_ok = _phong_basis_for_loops(me, loop_uv, uv2, base_face_of_loop2)
+        nrm_base = np.empty(len(me.loops) * 3, np.float32)
+        me.corner_normals.foreach_get("vector", nrm_base)
+        nrm_base = nrm_base.reshape(-1, 3)
+        pos_base = _read_vert_cos(me)
+        co = _read_vert_cos(tmp_me)   # 线性细分基面
+        p_lin_loop = co[lv2]
+
+        n_c = nrm_base[idx3]                       # (N2, 3角, 3)
+        p_c = pos_base[loop_vert[idx3]]
+        n_ph = np.einsum('lc,lcj->lj', w3, n_c)
         fb = np.empty(len(tmp_me.loops) * 3, np.float32)
         tmp_me.corner_normals.foreach_get("vector", fb)
-        n0_loop = _phong_normals_for_loops(me, loop_uv, uv2, base_face_of_loop2,
-                                           fb.reshape(-1, 3).astype(np.float64))
+        fb = fb.reshape(-1, 3)
+        bad = (~ph_ok) | (np.linalg.norm(n_ph, axis=1) < 1e-6)
+        n_ph[bad] = fb[bad]
+        n0_loop = (n_ph / np.maximum(np.linalg.norm(n_ph, axis=1), 1e-12)[:, None]
+                   ).astype(np.float32)
+
+        d_c = p_lin_loop[:, None, :] - p_c
+        dot_c = np.einsum('lcj,lcj->lc', d_c, n_c)
+        proj = p_lin_loop[:, None, :] - dot_c[..., None] * n_c
+        p_star = np.einsum('lc,lcj->lj', w3, proj)
+        bulge_loop = (np.float32(PHONG_ALPHA) * (p_star - p_lin_loop)).astype(np.float32)
+        bulge_loop[bad] = 0.0
+        del n_c, p_c, d_c, dot_c, proj, p_star
+
         h_loop = core.detrend_per_island(h_loop, uv2, island_of_loop2, n_islands, 'PLANE')
         h_loop = core.stitch_islands(h_loop, lv2, island_of_loop2, n_islands)
         h_loop *= w_loop   # 无效采样(未覆盖背景)不位移
@@ -1081,58 +1071,54 @@ def _build_inner(context, obj, s, report, t0):
                 if boundary_verts.size:
                     dvec[boundary_verts] = 0.0
 
-        co = _read_vert_cos(tmp_me)
-
-        # Catmull-Clark(平滑)细分的边界校正: CC 把开放边界向内收缩, 锁位移锁不住
-        # 细分自身的漂移——把边界顶点拉回线性细分位置(基面边缘原位), 校正量沿
-        # 图距离在 K 环内线性衰减, 平滑融入 CC 内部
+        # Phong 鼓形按"边界=0/内部=1"的 C1 连续混合场应用: 边界顶点严格留在
+        # 基面线性边缘(卡片缝隙锁死), 内部平滑升到全鼓形——smoothstep + 图扩散,
+        # 消掉整数环渐变的环间导数跳变(否则沿所有卡片边缘拉脊线)
         t_np2 = time.perf_counter()
-        corr_stat = ""
-        if coords_simple is not None and boundary_verts.size and ecount:
-            if coords_simple.shape[0] != vcount:
-                print(f"[NormalMapToMesh] 警告: SIMPLE 对照细分拓扑不匹配"
-                      f"({coords_simple.shape[0]:,} vs {vcount:,}), 跳过边界校正")
-            else:
-                k_rings = max(2, 2 ** (level - 1))
-                dist = np.full(vcount, k_rings + 1, np.int32)
-                dist[boundary_verts] = 0
-                for _ in range(k_rings):
-                    np.minimum.at(dist, e1, dist[e0] + 1)
-                    np.minimum.at(dist, e0, dist[e1] + 1)
-                # smoothstep(C1) + 图扩散: 整数环的线性渐变在每环边界有导数跳变,
-                # 会沿所有卡片边缘拉出脊线——抹成连续混合场(端点钉死)
-                s_lin = np.clip(1.0 - dist.astype(np.float32) / k_rings, 0.0, 1.0)
-                wgt = (s_lin * s_lin * (3.0 - 2.0 * s_lin)).astype(np.float32)
-                deg_w = (np.bincount(e0, minlength=vcount)
-                         + np.bincount(e1, minlength=vcount)).astype(np.float64)
-                deg_w = np.maximum(deg_w, 1.0)
-                pin1 = dist == 0
-                pin0 = dist > k_rings
-                for _ in range(4):
-                    sw = (np.bincount(e0, weights=wgt[e1], minlength=vcount)
-                          + np.bincount(e1, weights=wgt[e0], minlength=vcount))
-                    wgt = (0.5 * wgt + 0.5 * (sw / deg_w)).astype(np.float32)
-                    wgt[pin1] = 1.0
-                    wgt[pin0] = 0.0
-                corr = (coords_simple - co) * wgt[:, None]
-                co += corr
-                corr_stat = (f" | CC边界校正 max "
-                             f"{np.linalg.norm(corr, axis=1).max() * 1000:.2f}‰/{k_rings}环")
+        bulge_stat = ""
+        wgt_bulge = np.ones(vcount, np.float32)
+        if boundary_verts.size and ecount:
+            k_rings = max(2, 2 ** (level - 1))
+            dist = np.full(vcount, k_rings + 1, np.int32)
+            dist[boundary_verts] = 0
+            for _ in range(k_rings):
+                np.minimum.at(dist, e1, dist[e0] + 1)
+                np.minimum.at(dist, e0, dist[e1] + 1)
+            s_lin = np.clip(1.0 - dist.astype(np.float32) / k_rings, 0.0, 1.0)
+            wb = (s_lin * s_lin * (3.0 - 2.0 * s_lin)).astype(np.float32)
+            deg_w = (np.bincount(e0, minlength=vcount)
+                     + np.bincount(e1, minlength=vcount)).astype(np.float64)
+            deg_w = np.maximum(deg_w, 1.0)
+            pin1 = dist == 0
+            pin0 = dist > k_rings
+            for _ in range(4):
+                sw = (np.bincount(e0, weights=wb[e1], minlength=vcount)
+                      + np.bincount(e1, weights=wb[e0], minlength=vcount))
+                wb = (0.5 * wb + 0.5 * (sw / deg_w)).astype(np.float32)
+                wb[pin1] = 1.0
+                wb[pin0] = 0.0
+            wgt_bulge = 1.0 - wb
 
-        t_ccfix = time.perf_counter()
+        bulge_vert = core.average_loop_vectors_to_verts(bulge_loop, lv2, vcount)
+        bulge_vert *= wgt_bulge[:, None]
+        co += bulge_vert
+        bulge_stat = (f" | Phong鼓形 max "
+                      f"{np.linalg.norm(bulge_vert, axis=1).max() * 1000:.2f}‰")
+
+        t_phong = time.perf_counter()
         co += dvec
         tmp_me.vertices.foreach_set("co", co.ravel())
         tmp_me.update()
         mag = np.linalg.norm(dvec, axis=1)
-        disp_stat = (f"{n_islands} 岛 | 边界锁定 {boundary_verts.size:,} 顶点{corr_stat} | "
+        disp_stat = (f"{n_islands} 岛 | 边界锁定 {boundary_verts.size:,} 顶点{bulge_stat} | "
                      f"位移幅值 p50 {np.percentile(mag, 50) * 1000:.2f} / "
                      f"p95 {np.percentile(mag, 95) * 1000:.2f} / "
                      f"max {mag.max() * 1000:.2f} (千分之一物体单位)")
         t_displace = time.perf_counter()
         print(f"[NormalMapToMesh] 位移明细: 建层 {t_subdiv - t_front:.1f}s"
-              f" + 对照 {t_simple - t_subdiv:.1f}s + 基面求值 {t_eval - t_simple:.1f}s"
-              f" + 采样/岛处理 {t_np1 - t_eval:.1f}s + 锁边/平滑 {t_np2 - t_np1:.1f}s"
-              f" + CC校正 {t_ccfix - t_np2:.1f}s + 写坐标 {t_displace - t_ccfix:.1f}s")
+              f" + 基面求值 {t_eval - t_subdiv:.1f}s"
+              f" + 采样/岛/Phong {t_np1 - t_eval:.1f}s + 锁边/平滑 {t_np2 - t_np1:.1f}s"
+              f" + 鼓形混合 {t_phong - t_np2:.1f}s + 写坐标 {t_displace - t_phong:.1f}s")
 
         # ---- reshape 写回 Multires 位移层 ----
         tmp_obj = bpy.data.objects.new("NMTM_reshape_tmp", tmp_me)

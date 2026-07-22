@@ -47,14 +47,6 @@ class NMTMSettings(bpy.types.PropertyGroup):
     slope_limit: FloatProperty(
         name="坡度上限", default=10.0, min=0.0, soft_max=20.0, step=10, precision=1,
         description="坡度(tanθ)限幅, 压制烘焙噪声/压缩伪影导致的尖刺(0=关)")
-    subdiv_mode: EnumProperty(
-        name="细分方式",
-        items=(('SIMPLE', "Simple (保形)", "保持低模形状, 细节与烘焙面完全对位"),
-               ('CATMULL_CLARK', "平滑 (Catmull-Clark)",
-                "平滑基面; 开放边界的收缩漂移会用 SIMPLE 对照细分自动校正回基面边缘"
-                "(边缘钉死不产生缝隙), 首次构建多一次对照细分开销"),
-               ('LINEAR', "Linear", "线性细分")),
-        default='SIMPLE')
     auto_levels: BoolProperty(
         name="自动级别", default=True,
         description="按烘焙分辨率 × UV 占用率自动匹配 ≈1 四边形/texel")
@@ -96,7 +88,6 @@ class NMTM_PT_panel(bpy.types.Panel):
         box.prop(s, "edge_smooth_iters")
         box.prop(s, "deadzone_lsb")
         box.prop(s, "slope_limit")
-        box.prop(s, "subdiv_mode", text="细分")
         row = box.row()
         row.prop(s, "auto_levels")
         sub = row.row()
