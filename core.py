@@ -49,6 +49,47 @@ def sample_bilinear_wrap(field, u, v):
     return (a * (1.0 - tx) + b * tx) * (1.0 - ty) + (c * (1.0 - tx) + d * tx) * ty
 
 
+def sample_bspline_wrap(field, u, v):
+    """三次均匀 B 样条采样(16 タップ, wrap); field (H,W) 或 (H,W,C)。
+
+    位移曲面继承采样核的连续性: 双线性是 C0(texel 边界处导数跳变, 素模视图
+    下呈颗粒/折面感), 三次 B 样条是 C2——这才是"渲染级光滑"的几何等价物。
+    B 样条精确再现常量与线性场(细节形状不漂移), 高频略柔(≈附加 σ~0.5px,
+    正好吃掉残余混叠)。
+    """
+    h, w = field.shape[:2]
+    x = u * np.float32(w) - np.float32(0.5)
+    y = v * np.float32(h) - np.float32(0.5)
+    x0 = np.floor(x)
+    y0 = np.floor(y)
+    fx = (x - x0).astype(np.float32)
+    fy = (y - y0).astype(np.float32)
+    ix = x0.astype(np.int64)
+    iy = y0.astype(np.int64)
+
+    def bs_w(f):
+        f2 = f * f
+        f3 = f2 * f
+        return ((1.0 - f) ** 3 / 6.0,
+                (3.0 * f3 - 6.0 * f2 + 4.0) / 6.0,
+                (-3.0 * f3 + 3.0 * f2 + 3.0 * f + 1.0) / 6.0,
+                f3 / 6.0)
+
+    wx = bs_w(fx)
+    wy = bs_w(fy)
+    multi = field.ndim == 3
+    out = None
+    for j in range(4):
+        yj = (iy + (j - 1)) % h
+        wyj = wy[j][:, None] if multi else wy[j]
+        for i in range(4):
+            xi = (ix + (i - 1)) % w
+            wxi = wx[i][:, None] if multi else wx[i]
+            contrib = field[yj, xi] * (wyj * wxi)
+            out = contrib if out is None else out + contrib
+    return out
+
+
 def decode_unit_normal(rgb):
     """[0,1] 编码法线 → 单位向量 + 有效权重。
 
@@ -476,6 +517,19 @@ def _selftest():
     assert np.abs(got2 - got).max() < 1e-5
     got1 = sample_bilinear_wrap(field[..., 0], iu, iv)
     assert np.abs(got1 - field[17, :, 0]).max() < 1e-5
+
+    # B 样条: 常量/线性场精确再现 + wrap 等价 + 权重归一
+    const = np.full((h, w, 2), 0.7, np.float32)
+    gc = sample_bspline_wrap(const, iu, iv)
+    assert np.abs(gc - 0.7).max() < 1e-6, "B样条常量再现失败"
+    ramp = np.broadcast_to(np.arange(w, dtype=np.float32)[None, :], (h, w)).copy()
+    mid = np.full(16, (31 + 0.5) / h, np.float32)
+    xs = ((np.arange(16) * 3 + 8) + 0.5) / w
+    gr = sample_bspline_wrap(ramp, xs.astype(np.float32), mid)
+    assert np.abs(gr - (np.arange(16) * 3 + 8)).max() < 1e-3, "B样条线性再现失败"
+    gw = sample_bspline_wrap(field, iu + 1.0, iv)
+    assert np.abs(gw - sample_bspline_wrap(field, iu, iv)).max() < 1e-5, "B样条wrap失败"
+    print("[B样条] 常量/线性再现 + wrap 校验通过")
 
     # ---- 端到端: 平面片高度场 → (n1, n0, P) 烘焙图合成 → 梯度装配 → 积分还原 ----
     # 平面绕 Z 转 30°(模拟"UV 轴 ≠ 物体轴"), 尺度 A×B 各不相同(模拟逐岛密度)

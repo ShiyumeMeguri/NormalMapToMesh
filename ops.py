@@ -834,14 +834,8 @@ def _build_inner(context, obj, s, report, t0):
         bake_size, loop_uv, loop_vert, bool(s.force_bake),
         s.deadzone_lsb / 127.5, s.slope_limit)
 
-    # 高斯预滤(σ=像素): 压掉量化/欠采样噪声——2048 贴图对百万级顶点是欠采样,
-    # texel 级抖动会直接刻成表面斑点; 细节波长 ≳4σ 的保留
-    smooth_sigma = (s.smooth_px / bake_size) if s.smooth_px > 0 else 0.0
-    field = core.integrate_height(gx, gy, 0.0, smooth_sigma)
     if not (wmap > 0).any():
         raise RuntimeError("梯度全部无效(UV 未覆盖/法线异常), 高度重建失败")
-    print(f"[NormalMapToMesh] 梯度有效率 {wmap.mean():.1%} | "
-          f"高度场 p95 {np.percentile(np.abs(field[wmap > 0]), 95) * 1000:.2f}‰")
     t_front = time.perf_counter()
 
     fill = _uv_fill(me, loop_uv)
@@ -865,6 +859,18 @@ def _build_inner(context, obj, s, report, t0):
             level -= 1
     level = max(1, level)
     quads = len(me.loops) * (4 ** (level - 1))
+
+    # ---- 高斯预滤 + FC 积分 ----
+    # σ 下限 = 顶点 Nyquist: 顶点间距粗于 texel 时(欠采样), texel 级抖动会混叠
+    # 成表面颗粒——带限是下限保障, 用户的"表面平滑"只能在其上加码
+    texels_per_edge = float(np.sqrt(bake_size * bake_size * fill / max(quads, 1)))
+    sigma_floor = 0.6 * texels_per_edge if texels_per_edge > 1.0 else 0.0
+    smooth_px_eff = max(float(s.smooth_px), sigma_floor)
+    field = core.integrate_height(
+        gx, gy, 0.0, (smooth_px_eff / bake_size) if smooth_px_eff > 0 else 0.0)
+    print(f"[NormalMapToMesh] 梯度有效率 {wmap.mean():.1%} | "
+          f"高度场 p95 {np.percentile(np.abs(field[wmap > 0]), 95) * 1000:.2f}‰ | "
+          f"σ {smooth_px_eff:.2f}px (下限 {sigma_floor:.2f})")
 
     # ---- 建层(只为 Multires 数据结构; reshape 会完整覆写 MDISPS) ----
     # 层数已匹配则整段跳过(重建快路径); 建层在隐藏态跑——细分面从此只当
@@ -921,9 +927,11 @@ def _build_inner(context, obj, s, report, t0):
         lv2 = _read_loop_verts(tmp_me)
         uv2 = _read_loop_uvs(tmp_me)
 
-        # 逐 loop 采样(高度 + 基准法线 + 有效权重, 拼一次采样)
+        # 逐 loop 采样(高度 + 基准法线 + 有效权重, 拼一次采样)。
+        # 三次 B 样条(C2): 位移曲面继承采样核的连续性——双线性的 C0 折面
+        # 正是素模/雕刻视图"颗粒感"的来源, 渲染级光滑的几何等价物是 C2 插值
         samp = np.concatenate([field[..., None], n0_enc, wmap[..., None]], axis=2)
-        s5 = core.sample_bilinear_wrap(samp, uv2[:, 0], uv2[:, 1])
+        s5 = core.sample_bspline_wrap(samp, uv2[:, 0], uv2[:, 1])
         h_loop = s5[:, 0].astype(np.float32)
         n0_loop, w0_loop = core.decode_unit_normal(s5[:, 1:4])
         w_loop = (s5[:, 4] > 0.5).astype(np.float32) * w0_loop
