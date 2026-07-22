@@ -360,11 +360,14 @@ def _mesh_fingerprint(me, loop_uv):
 
 def _gradients_direct(obj, me, source, image, size, loop_uv, loop_vert,
                       deadzone=0.0, slope_limit=0.0):
-    """免烘焙直算: mikktspace 切线帧 + 逐三角形解析 ∂P → UV 高度梯度。
+    """免烘焙直算: mikktspace 切线帧标量 + 逐三角形解析 ∂P → UV 高度梯度。
 
-    与烘焙路径同一代数; 镜像/混合手性由逐 loop bitangent_sign 精确携带,
-    解析 ∂P 消灭了位置图有限差分与岛间沟槽问题。
-    返回 (gx, gy, wmap, n0_enc[编码基准法线网格, 与烘焙 rgb_base 同构消费])。
+    shader 等价求值纪律——几何属性不进"赢家覆盖"的共享网格:
+    重叠 UV 卡片(正/背面、镜像复用、图集多层)会让逐 texel 覆盖形成
+    逐三角形补丁的属性马赛克, 正/背面梯度互为相反数, 积分后成严重锯齿。
+    因此: ①梯度帧标量只由**正 UV 绕向**三角形贡献且逐 texel **平均**
+    (孤儿镜像岛用负绕向做二次补洞); ②位移方向不进网格, 由消费端取
+    各 loop 自己网格的平滑角法线。返回 (gx, gy, wmap)。
     """
     uv_name = me.uv_layers.active.name
     try:
@@ -405,16 +408,33 @@ def _gradients_direct(obj, me, source, image, size, loop_uv, loop_vert,
     pu = (e1 * d2[:, 1, None] - e2 * d1[:, 1, None]) / det_safe[:, None]
     pv = (e2 * d1[:, 0, None] - e1 * d2[:, 0, None]) / det_safe[:, None]
 
-    # 逐角属性: T(3) N(3) sign(1) + 逐三角形常量 Pu(3) Pv(3) mat(1) = C14
-    attrs = np.empty((t_count, 3, 14), np.float32)
-    attrs[:, :, 0:3] = tan[tl.ravel()].reshape(-1, 3, 3)
-    attrs[:, :, 3:6] = nrm[tl.ravel()].reshape(-1, 3, 3)
-    attrs[:, :, 6] = sign[tl.ravel()].reshape(-1, 3)
-    attrs[:, :, 7:10] = pu.astype(np.float32)[:, None, :]
-    attrs[:, :, 10:13] = pv.astype(np.float32)[:, None, :]
-    attrs[:, :, 13] = pmat[tp].astype(np.float32)[:, None]
+    # 逐角切线帧标量: au=T·Pu, bu=B·Pu, av=T·Pv, bv=B·Pv (B = sign·N×T)
+    tc = tan[tl.ravel()].reshape(-1, 3, 3).astype(np.float64)
+    nc = nrm[tl.ravel()].reshape(-1, 3, 3).astype(np.float64)
+    sc = sign[tl.ravel()].reshape(-1, 3).astype(np.float64)
+    bc = np.cross(nc, tc) * sc[:, :, None]
+    attrs = np.empty((t_count, 3, 4), np.float32)
+    attrs[:, :, 0] = np.einsum('tcj,tj->tc', tc, pu)
+    attrs[:, :, 1] = np.einsum('tcj,tj->tc', bc, pu)
+    attrs[:, :, 2] = np.einsum('tcj,tj->tc', tc, pv)
+    attrs[:, :, 3] = np.einsum('tcj,tj->tc', bc, pv)
 
-    grid, mask0 = core.rasterize_tris(tri_uv[valid], attrs[valid], size)
+    # 正绕向为主贡献(逐 texel 平均), 负绕向只补正绕向没覆盖的洞
+    pos_sel = valid & (det > 0)
+    neg_sel = valid & (det < 0)
+    sum_p, cnt_p = core.rasterize_tris(tri_uv[pos_sel], attrs[pos_sel], size,
+                                       accumulate=True)
+    frame = np.zeros((size, size, 4), np.float32)
+    covered_p = cnt_p > 0
+    frame[covered_p] = sum_p[covered_p] / cnt_p[covered_p][:, None]
+    mask0 = covered_p
+    if neg_sel.any():
+        sum_n, cnt_n = core.rasterize_tris(tri_uv[neg_sel], attrs[neg_sel], size,
+                                           accumulate=True)
+        fill = (~covered_p) & (cnt_n > 0)
+        if fill.any():
+            frame[fill] = sum_n[fill] / cnt_n[fill][:, None]
+            mask0 = covered_p | fill
 
     # 切线空间法线图
     if source == 'IMAGE':
@@ -431,26 +451,24 @@ def _gradients_direct(obj, me, source, image, size, loop_uv, loop_vert,
         if len(mat_maps) == 1:
             t_map = np.ascontiguousarray(mat_maps[0])
         else:
-            # 多材质槽: 光栅化的逐 texel 材质号选择对应贴图链结果
-            mi = np.clip(np.round(grid[..., 13]).astype(np.int64), 0, len(mat_maps) - 1)
+            # 多材质槽: 逐 texel 材质号(覆盖式光栅化)选择对应贴图链结果
+            mat_attr = np.broadcast_to(
+                pmat[tp].astype(np.float32)[:, None, None], (t_count, 3, 1)).copy()
+            mgrid, _ = core.rasterize_tris(tri_uv[valid], mat_attr[valid], size)
+            mi = np.clip(np.round(mgrid[..., 0]).astype(np.int64), 0, len(mat_maps) - 1)
             t_map = np.empty((size, size, 3), np.float32)
             for i, m in enumerate(mat_maps):
                 sel = mi == i
                 t_map[sel] = m[sel]
 
-    # 梯度只取真实 UV 覆盖区(mask0): 外扩 margin 的复制内容会虚增积分能量
-    gx, gy, _ = core.gradients_from_tangent_frames(
-        t_map, grid[..., 0:3], grid[..., 3:6], grid[..., 6],
-        grid[..., 7:10], grid[..., 10:13], mask0,
+    # 梯度只取真实 UV 覆盖区: 外扩 margin 的复制内容会虚增积分能量
+    gx, gy, _ = core.gradients_from_frame_scalars(
+        t_map, frame[..., 0], frame[..., 1], frame[..., 2], frame[..., 3], mask0,
         deadzone=deadzone, slope_limit=slope_limit)
 
-    # 采样连续性只需要法线通道外扩(岛边界 bilinear 不吃到无效 texel)
-    n0grid, mask1 = core.dilate_grid(grid[..., 3:6], mask0, BAKE_MARGIN)
-    ln = np.linalg.norm(n0grid, axis=-1, keepdims=True)
-    n0_enc = (n0grid / np.maximum(ln, 1e-12) + 1.0) * 0.5
-    n0_enc[~mask1] = 0.0   # 未覆盖 texel 编码为无效(解码长度 1.73 → 权重 0)
-    wmap = mask1.astype(np.float32)
-    return gx, gy, wmap, n0_enc.astype(np.float32)
+    # 采样有效域: 掩码外扩(岛边界 B 样条采样不吃到无效 texel)
+    wmap = core.dilate_mask(mask0, BAKE_MARGIN).astype(np.float32)
+    return gx, gy, wmap
 
 
 def _gradients_cached(context, obj, me, source, image, size, loop_uv, loop_vert,
@@ -475,7 +493,7 @@ def _gradients_cached(context, obj, me, source, image, size, loop_uv, loop_vert,
         rgb_detail, rgb_base, pos_map = _bake_triple(context, obj, source, image, size, loop_uv)
         gx, gy, wmap = core.height_gradients(rgb_detail, rgb_base, pos_map,
                                              deadzone=deadzone, slope_limit=slope_limit)
-        result = (gx, gy, wmap, rgb_base)
+        result = (gx, gy, wmap)
     _cache_put(_grad_cache, key, result)
     return result
 
@@ -829,7 +847,7 @@ def _build_inner(context, obj, s, report, t0):
     loop_uv = _read_loop_uvs(me)
     loop_vert = _read_loop_verts(me)
     bake_size = int(s.bake_size)
-    gx, gy, wmap, n0_enc = _gradients_cached(
+    gx, gy, wmap = _gradients_cached(
         context, obj, me, source, s.image if source == 'IMAGE' else None,
         bake_size, loop_uv, loop_vert, bool(s.force_bake),
         s.deadzone_lsb / 127.5, s.slope_limit)
@@ -927,14 +945,17 @@ def _build_inner(context, obj, s, report, t0):
         lv2 = _read_loop_verts(tmp_me)
         uv2 = _read_loop_uvs(tmp_me)
 
-        # 逐 loop 采样(高度 + 基准法线 + 有效权重, 拼一次采样)。
-        # 三次 B 样条(C2): 位移曲面继承采样核的连续性——双线性的 C0 折面
-        # 正是素模/雕刻视图"颗粒感"的来源, 渲染级光滑的几何等价物是 C2 插值
-        samp = np.concatenate([field[..., None], n0_enc, wmap[..., None]], axis=2)
-        s5 = core.sample_bspline_wrap(samp, uv2[:, 0], uv2[:, 1])
-        h_loop = s5[:, 0].astype(np.float32)
-        n0_loop, w0_loop = core.decode_unit_normal(s5[:, 1:4])
-        w_loop = (s5[:, 4] > 0.5).astype(np.float32) * w0_loop
+        # 逐 loop 采样(高度 + 有效权重)。三次 B 样条(C2): 位移曲面继承采样核的
+        # 连续性——双线性的 C0 折面正是素模/雕刻视图"颗粒感"的来源
+        samp = np.stack([field, wmap], axis=-1)
+        s2 = core.sample_bspline_wrap(samp, uv2[:, 0], uv2[:, 1])
+        h_loop = s2[:, 0].astype(np.float32)
+        w_loop = (s2[:, 1] > 0.5).astype(np.float32)
+        # 位移方向 = 各 loop 自己网格的平滑角法线(shader 等价求值; 不走共享网格,
+        # 镜像岛/背面方向天然正确, 无赢家马赛克)
+        n0_loop = np.empty(len(tmp_me.loops) * 3, np.float32)
+        tmp_me.corner_normals.foreach_get("vector", n0_loop)
+        n0_loop = n0_loop.reshape(-1, 3)
 
         # 逐岛去趋势+缝合: 全局积分给每岛留下的任意偏移/斜坡, 用基面拓扑映射
         # (细分面按基面连续分块)精确归岛后消除

@@ -155,18 +155,24 @@ def height_gradients(rgb_detail, rgb_base, pos, min_cos=0.2,
 # 直算前端: UV 三角形光栅化 + 切线空间梯度(免烘焙)
 # ---------------------------------------------------------------------------
 
-def rasterize_tris(tri_uv, tri_attr, size):
+def rasterize_tris(tri_uv, tri_attr, size, accumulate=False):
     """UV 三角形光栅化: 逐 texel 重心插值角属性。
 
-    tri_uv (T,3,2) float32, tri_attr (T,3,C) float32 → (grid (S,S,C), mask (S,S))。
-    texel 中心 ((x+0.5)/S, (y+0.5)/S); 按 bbox 尺寸分桶批量向量化;
-    重叠 texel 后写覆盖(与烘焙的任意覆盖语义等价); 退化 UV 三角形跳过。
+    tri_uv (T,3,2) float32, tri_attr (T,3,C) float32。
+    accumulate=False: 重叠 texel 后写覆盖 → (grid (S,S,C), mask (S,S))。
+    accumulate=True: 重叠 texel 累加平均的分子/分母 → (sum (S,S,C), count (S,S))
+    ——多张卡片共享同一贴图区域时, 覆盖会产生"赢家马赛克"(逐三角形补丁的
+    属性跳变, 积分后成锯齿), 平均则得到平滑的折中场。
+    texel 中心 ((x+0.5)/S, (y+0.5)/S); 按 bbox 尺寸分桶批量向量化; 退化三角形跳过。
     """
     n_ch = tri_attr.shape[2]
     grid = np.zeros((size, size, n_ch), np.float32)
+    if accumulate:
+        cnt = np.zeros(size * size, np.float64)
+        acc = np.zeros((size * size, n_ch), np.float64)
     mask = np.zeros((size, size), bool)
     if tri_uv.shape[0] == 0:
-        return grid, mask
+        return (grid, mask) if not accumulate else (grid, np.zeros((size, size), np.float32))
     gflat = grid.reshape(-1, n_ch)
     mflat = mask.reshape(-1)
 
@@ -221,10 +227,19 @@ def rasterize_tris(tri_uv, tri_attr, size):
                     + l2[..., None] * attr[:, 2][:, None, None, :])
             gi = ys[:, :, None] * size + xs[:, None, :]            # (n,kk,kk)
             idx = gi[inside]
-            gflat[idx] = vals[inside].astype(np.float32)
-            mflat[idx] = True
+            if accumulate:
+                vin = vals[inside]
+                for c in range(n_ch):
+                    acc[:, c] += np.bincount(idx, weights=vin[:, c], minlength=size * size)
+                cnt += np.bincount(idx, minlength=size * size)
+            else:
+                gflat[idx] = vals[inside].astype(np.float32)
+                mflat[idx] = True
         if order.size == 0:
             break
+    if accumulate:
+        grid = acc.astype(np.float32).reshape(size, size, n_ch)
+        return grid, cnt.astype(np.float32).reshape(size, size)
     return grid, mask
 
 
@@ -250,18 +265,18 @@ def dilate_grid(grid, mask, iters):
     return g, m
 
 
-def gradients_from_tangent_frames(t_xyz, tan_grid, nrm_grid, sign_grid,
-                                  pu_grid, pv_grid, mask, min_cos=0.2,
-                                  deadzone=0.0, slope_limit=0.0):
-    """切线空间法线网格 + 光栅化切线帧 → UV 高度梯度(免烘焙直算)。
+def gradients_from_frame_scalars(t_xyz, au, bu, av, bv, mask, min_cos=0.2,
+                                 deadzone=0.0, slope_limit=0.0):
+    """切线空间法线图 + 光栅化切线帧标量 → UV 高度梯度(免烘焙直算)。
 
-    与烘焙路径同一代数(逐 texel): n1 ∝ T·tx + B·ty + N·tz, B = sign·(N×T),
-    g = n0 − n1/max(n1·n0, min_cos) 化简为 g = −(T·tx + B·ty)/max(tz, min_cos·|t|),
-    dh/du = g·∂P/∂u, dh/dv = g·∂P/∂v (∂P 为逐三角形解析常量, 无沟槽假差分)。
+    与烘焙路径同一代数(逐 texel): g = −(T·tx + B·ty)/max(tz, min_cos·|t|),
+    dh/du = g·∂P/∂u = −(au·fx + bu·fy), 其中 au=T·∂P/∂u, bu=B·∂P/∂u,
+    av=T·∂P/∂v, bv=B·∂P/∂v 为逐角解析标量(可跨重叠卡片逐 texel 平均——
+    标量平均 = 各卡片高度函数的世界尺度折中, 平滑无马赛克)。
     |t| 异常(未覆盖/坏像素)或 cos ≤ min_cos 的 texel 权重归零。
-    deadzone: |tx|/|ty| ≤ 该值(归一化)视为纯平——8bit 量化的 ±1 LSB 噪声
-    经泊松积分会放大成低频起伏/表面斑点, 死区让平坦区严格为平。
-    slope_limit: 坡度幅值(tanθ)限幅, 压制烘焙噪声/压缩伪影的尖刺。
+    deadzone: |tx|/|ty| ≤ 该值(归一化)视为纯平——8bit 量化噪声经积分会放大
+    成低频起伏/斑点, 死区让平坦区严格为平。
+    slope_limit: 坡度幅值(tanθ)限幅, 压制噪声/压缩伪影的尖刺。
     """
     tx = t_xyz[..., 0]
     ty = t_xyz[..., 1]
@@ -269,10 +284,6 @@ def gradients_from_tangent_frames(t_xyz, tan_grid, nrm_grid, sign_grid,
     ln = np.sqrt(tx * tx + ty * ty + tz * tz)
     cosw = tz / np.maximum(ln, 1e-12)
     w = (mask & (ln > 0.25) & (ln < 2.25) & (cosw > min_cos)).astype(np.float32)
-
-    bx = sign_grid * (nrm_grid[..., 1] * tan_grid[..., 2] - nrm_grid[..., 2] * tan_grid[..., 1])
-    by = sign_grid * (nrm_grid[..., 2] * tan_grid[..., 0] - nrm_grid[..., 0] * tan_grid[..., 2])
-    bz = sign_grid * (nrm_grid[..., 0] * tan_grid[..., 1] - nrm_grid[..., 1] * tan_grid[..., 0])
 
     denom = np.maximum(tz, np.float32(min_cos) * ln)
     denom = np.maximum(denom, 1e-12)
@@ -287,13 +298,20 @@ def gradients_from_tangent_frames(t_xyz, tan_grid, nrm_grid, sign_grid,
         scale = np.minimum(1.0, slope_limit / np.maximum(mag, 1e-12))
         fx = fx * scale
         fy = fy * scale
-    gvx = -(tan_grid[..., 0] * fx + bx * fy)
-    gvy = -(tan_grid[..., 1] * fx + by * fy)
-    gvz = -(tan_grid[..., 2] * fx + bz * fy)
-
-    gx = (gvx * pu_grid[..., 0] + gvy * pu_grid[..., 1] + gvz * pu_grid[..., 2]) * w
-    gy = (gvx * pv_grid[..., 0] + gvy * pv_grid[..., 1] + gvz * pv_grid[..., 2]) * w
+    gx = -(au * fx + bu * fy) * w
+    gy = -(av * fx + bv * fy) * w
     return gx.astype(np.float32), gy.astype(np.float32), w
+
+
+def dilate_mask(mask, iters):
+    """布尔掩码 4 邻域膨胀 iters 圈(岛边界采样安全余量)。"""
+    m = mask.copy()
+    for _ in range(iters):
+        if m.all():
+            break
+        m = (m | np.roll(m, 1, 0) | np.roll(m, -1, 0)
+             | np.roll(m, 1, 1) | np.roll(m, -1, 1))
+    return m
 
 
 # ---------------------------------------------------------------------------
@@ -591,38 +609,48 @@ def _selftest():
     gxb, gyb, wb = height_gradients(n1_bad, enc(np.array(n0_vec)), pos)
     assert wb[:8].max() == 0.0 and np.abs(gxb[:4]).max() == 0.0, "背景未归零"
 
-    # ---- 直算前端: 光栅化切线帧 + 免烘焙梯度, 应还原同一高度场 ----
-    # 两个大三角覆盖全 UV 方格; 平面绕 Z 30°, 尺度 A×B(同上), T=ex, B=ey, sign=+1
-    pu_v = (A * ex).astype(np.float32)
-    pv_v = (B * ey).astype(np.float32)
+    # ---- 直算前端: 光栅化切线帧标量 + 免烘焙梯度, 应还原同一高度场 ----
+    # 两个大三角覆盖全 UV 方格; 平面绕 Z 30°, 尺度 A×B(同上), T=ex, B=ey:
+    # au = T·Pu = A, bu = 0, av = 0, bv = B
     corner = np.array([[-0.2, -0.2], [1.4, -0.2], [-0.2, 1.4],
                        [1.4, -0.2], [1.4, 1.4], [-0.2, 1.4]], np.float32)
     tri_uv = corner.reshape(2, 3, 2)
-    attr1 = np.concatenate([ex, ez, [1.0], pu_v, pv_v]).astype(np.float32)   # C=13
-    tri_attr = np.broadcast_to(attr1, (2, 3, 13)).copy()
+    attr1 = np.array([A, 0.0, 0.0, B], np.float32)
+    tri_attr = np.broadcast_to(attr1, (2, 3, 4)).copy()
     grid, gmask = rasterize_tris(tri_uv, tri_attr, w2)
     assert gmask.all(), "全覆盖光栅化出现空洞"
     # 合成切线空间法线贴图: t ∝ (−dh/dx, −dh/dy, 1) (x=u·A 世界轴)
     t_map = np.stack([-(dh_du / A), -(dh_dv / B), np.ones_like(dh_du)], axis=-1)
     t_map = (t_map / np.linalg.norm(t_map, axis=-1, keepdims=True)).astype(np.float32)
-    gxd, gyd, wd = gradients_from_tangent_frames(
-        t_map, grid[..., 0:3], grid[..., 3:6], grid[..., 6],
-        grid[..., 7:10], grid[..., 10:13], gmask)
+    gxd, gyd, wd = gradients_from_frame_scalars(
+        t_map, grid[..., 0], grid[..., 1], grid[..., 2], grid[..., 3], gmask)
     assert wd.min() > 0.99, "直算权重异常"
     rec_d = integrate_height(gxd, gyd).astype(np.float64)
     diff_d = rec_d - height
     diff_d -= diff_d.mean()
     rel_d = np.sqrt(np.mean(diff_d ** 2)) / np.sqrt(np.mean(height ** 2))
-    print(f"[直算前端] 光栅化+切线帧梯度 相对RMS误差 = {rel_d:.2e}")
+    print(f"[直算前端] 光栅化+切线帧标量梯度 相对RMS误差 = {rel_d:.2e}")
     assert rel_d < 2e-2, "直算前端还原失败"
 
-    # 膨胀: 挖洞后 4 圈填充应恢复邻域值
+    # 累加平均光栅化: 双份同属性三角形 → count=2, 均值等于覆盖值(马赛克免疫)
+    tri_uv2 = np.concatenate([tri_uv, tri_uv], axis=0)
+    tri_attr2 = np.concatenate([tri_attr, tri_attr * 3.0], axis=0)
+    ssum, scnt = rasterize_tris(tri_uv2, tri_attr2, 64, accumulate=True)
+    inner = scnt[8:56, 8:56]
+    assert inner.min() >= 2.0, "累加计数异常"
+    avg0 = ssum[32, 32, 0] / scnt[32, 32]
+    assert abs(avg0 - 2.0 * A) < 1e-4, f"累加平均异常: {avg0} vs {2.0 * A}"
+
+    # 膨胀: 挖洞后 4 圈填充应恢复邻域值; 布尔膨胀覆盖扩圈
     hole = grid.copy()
     hmask = gmask.copy()
     hmask[100:104, 100:104] = False
     hole[100:104, 100:104] = 0.0
     filled, fmask = dilate_grid(hole, hmask, 4)
     assert fmask.all() and abs(float(filled[101, 101, 0]) - float(grid[101, 101, 0])) < 1e-5
+    bm = np.zeros((16, 16), bool)
+    bm[8, 8] = True
+    assert dilate_mask(bm, 2).sum() == 13, "布尔膨胀圈数异常"
 
     # ---- FC 积分基准面锚定 ----
     r2 = (ug - 0.5) ** 2 + (vg - 0.5) ** 2
