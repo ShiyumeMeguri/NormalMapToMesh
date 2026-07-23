@@ -34,6 +34,11 @@ class NMTMSettings(bpy.types.PropertyGroup):
         name="强制烘焙路径", default=False,
         description="跳过直算前端, 强制走 Cycles EMIT 烘焙(兼容任意材质节点网络; "
                     "默认关——直算不支持的节点会自动回退烘焙)")
+    detail_smooth_px: FloatProperty(
+        name="细节平滑 (px)", default=1.0, min=0.0, soft_max=4.0, step=10, precision=1,
+        description="高度场的分辨率无关高斯平滑(源贴图像素): 8bit 量化/BC 压缩块"
+                    "伪影的坡度噪声经积分会放大成固定尺度凹凸(贴图噪声被过拟合成"
+                    "几何), 该噪声地板把它压掉; 与细分级别无关, 0=关")
     deadzone_lsb: FloatProperty(
         name="平整死区 (LSB)", default=1.0, min=0.0, soft_max=4.0, step=10, precision=1,
         description="法线 XY 分量低于该值(8bit 台阶数)视为纯平——量化噪声经积分会"
@@ -79,6 +84,7 @@ class NMTM_PT_panel(bpy.types.Panel):
         box = layout.box()
         box.label(text="选项", icon='PREFERENCES')
         box.prop(s, "edge_falloff_px")
+        box.prop(s, "detail_smooth_px")
         box.prop(s, "deadzone_lsb")
         box.prop(s, "slope_limit")
         row = box.row()

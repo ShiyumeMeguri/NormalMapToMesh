@@ -15,9 +15,14 @@
 #      细分平滑(法线图只携带高频细节), 而所有 UV 岛边界边 crease=1 + 岛界顶点
 #      vertex crease=1——折痕链逐级取中点且端点钉死, 边界折线被精确锁在原位
 #      (CC 默认把边界链平滑成 B 样条曲线, 即"边缘软化"/卡片缝隙的根源)。
-#      UV 与低模角法线(NMTM_N0 corner 属性)保持线性插值(uv_smooth=NONE),
-#      位移方向即 shader 的逐像素插值法线场, 采样对位不随细分漂移。
-#   5. 采样高度(B 样条 C2) → 逐岛去趋势/缝合 → 边界硬锁 → 位移 → reshape 写回。
+#      UV 保持线性插值(uv_smooth=NONE), 采样对位不随细分漂移。
+#   5. 位移是光滑场作用于光滑曲面, 全链无离散值直读: 方向 = 极限曲面自身的
+#      光滑法线场(极限采样网格的平滑顶点法线, O(顶点距²) 收敛——平坦低模的
+#      Phong 插值场在每条基面边有 C0 折痕, 会把线框浮雕进曲面, 已废除);
+#      高度 = 固定物理场 × 级别匹配重建滤波(线性网格要呈现平滑曲面, 内容
+#      波长须 ≳6×顶点距; 如同曲线之于控制点——少点=同一条曲线的光滑粗版)
+#      × 分辨率无关的源噪声地板(8bit/BC 压缩坡度噪声积分成固定尺度凹凸)。
+#      采样高度(B 样条 C2) → 逐岛去趋势/缝合 → 边界硬锁 → 位移 → reshape 写回。
 #
 # 重复点"应用"= 从基面重建(幂等), 改倍数即所见即所得(全缓存命中, 只剩写回)。
 
@@ -828,16 +833,10 @@ def _subsurf_eval_mesh(context, obj, level, border_edges, border_verts):
     岛界边 crease=1 + 岛界顶点 vertex crease=1: 折痕链逐级取线性中点、原顶点
     钉死——边界折线精确保持原位(CC 默认把边界链平滑成 B 样条曲线 = 边缘软化);
     内部收敛到 C2 极限曲面, use_limit_surface 使任何级别都是同一曲面的嵌套采样。
-    副本上把低模平滑角法线写成 corner 属性 NMTM_N0, uv_smooth=NONE 保证 UV 与
-    该属性均为纯线性插值(shader 重心插值同构), 全程零高模数据。与用户已有
-    折痕取 max 合并, 原网格不动。
+    uv_smooth=NONE 保证 UV 纯线性插值(shader 重心插值同构, 采样对位不漂)。
+    与用户已有折痕取 max 合并, 原网格不动。
     """
     me2 = obj.data.copy()
-    nrm = np.empty(len(me2.loops) * 3, np.float32)
-    me2.corner_normals.foreach_get("vector", nrm)
-    attr = me2.attributes.new("NMTM_N0", 'FLOAT_VECTOR', 'CORNER')
-    attr.data.foreach_set("vector", nrm)
-
     ec = me2.attributes.get("crease_edge")
     if ec is None or ec.domain != 'EDGE':
         ec = me2.attributes.new("crease_edge", 'FLOAT', 'EDGE')
@@ -1015,14 +1014,17 @@ def _build_inner(context, obj, s, report, t0):
     level = max(1, level)
     quads = len(me.loops) * (4 ** (level - 1))
 
-    # ---- Neumann(镜像)积分 (无风格化模糊) ----
-    # 唯一的带限 = 顶点 Nyquist 抗混叠下限(采样理论要求, 非平滑参数):
-    # 顶点间距粗于 texel 时, texel 级信号无法被网格表达, 不滤除即成混叠颗粒;
-    # 自动级别(1 四边形/texel)下该下限为 0——完全无损
+    # ---- Neumann(镜像)积分 + 两级带限 ----
+    # ① 级别匹配重建滤波(采样理论): 顶点间线性插值要呈现平滑曲面, 内容波长须
+    #    ≳6×顶点距——σ=1.5×texel/顶点距。旧 0.6 系数把内容钉在每级 ~3.75 采样/
+    #    波长, 呈现恒为多边形折面感且各级观感相同("升级别不变光滑"的根源)。
+    #    高度物理场本身固定, 各级别是它经该滤波的光滑投影(曲线之于控制点)。
+    # ② 源噪声地板(分辨率无关, 与级别无关): 8bit 量化/BC 压缩块的坡度噪声经
+    #    积分放大成固定尺度凹凸(把贴图噪声过拟合成几何), 恒定 σ 压掉。
     texels_per_edge = float(np.sqrt(bake_size * bake_size * fill / max(quads, 1)))
-    sigma_floor = 0.6 * texels_per_edge if texels_per_edge > 1.0 else 0.0
-    field = core.integrate_height(
-        gx, gy, smooth_sigma=(sigma_floor / bake_size) if sigma_floor > 0 else 0.0)
+    sigma_sampling = 1.5 * texels_per_edge
+    sigma_px = float(np.sqrt(float(s.detail_smooth_px) ** 2 + sigma_sampling ** 2))
+    field = core.integrate_height(gx, gy, smooth_sigma=sigma_px / bake_size)
 
     # 开放边界(卡片边缘)衰减: 高度场沿 UV 距离场 smoothstep 归零。场量属于
     # 低模 UV 域, 与细分级别无关; 边界顶点另有硬锁零位移兜底
@@ -1035,7 +1037,8 @@ def _build_inner(context, obj, s, report, t0):
             fall_stat = f" | 边缘衰减 {int(s.edge_falloff_px)}px/{seg.shape[0]:,}段"
     print(f"[NormalMapToMesh] 梯度有效率 {wmap.mean():.1%} | "
           f"高度场 p95 {np.percentile(np.abs(field[wmap > 0]), 95) * 1000:.2f}‰ | "
-          f"抗混叠下限 σ {sigma_floor:.2f}px{fall_stat}")
+          f"重建滤波 σ {sigma_sampling:.2f}px ⊕ 噪声地板 {float(s.detail_smooth_px):.1f}px"
+          f"{fall_stat}")
 
     # ---- 建层(只为 Multires 数据结构; reshape 会完整覆写 MDISPS) ----
     # 层数已匹配则整段跳过(重建快路径); 建层在隐藏态跑——细分面从此只当
@@ -1097,28 +1100,20 @@ def _build_inner(context, obj, s, report, t0):
             raise RuntimeError(
                 f"细分拓扑映射失配: {island_of_loop2.shape[0]:,} vs {h_loop.shape[0]:,}")
 
-        # 位移方向 = 低模平滑角法线经 SIMPLE 细分线性插值的连续场(NMTM_N0 角
-        # 属性), 插值后归一化——与 shader 逐像素插值法线同构, 面内 C∞;
-        # 细分网格自身重算的离散角法线(SIMPLE 下逐基面跳变)禁止入场
-        n0_attr = tmp_me.attributes.get("NMTM_N0")
-        if n0_attr is None:
-            raise RuntimeError("细分求值丢失 NMTM_N0 角法线属性(Subsurf 未插值 corner 属性?)")
-        nbuf = np.empty(len(tmp_me.loops) * 3, np.float32)
-        n0_attr.data.foreach_get("vector", nbuf)
-        n0_loop = nbuf.reshape(-1, 3)
-        n0_loop /= np.maximum(np.linalg.norm(n0_loop, axis=1), 1e-12)[:, None]
         h_loop = core.detrend_per_island(h_loop, uv2, island_of_loop2, n_islands, 'PLANE')
         h_loop = core.stitch_islands(h_loop, lv2, island_of_loop2, n_islands)
         h_loop *= w_loop   # 无效采样(未覆盖背景)不位移
         t_np1 = time.perf_counter()
 
-        # 沿基准法线位移 × 高度倍数
+        # 位移方向 = 极限曲面自身的光滑法线场(极限采样网格的平滑顶点法线,
+        # O(顶点距²) 收敛): 位移是向量场作用于光滑曲面, 全网无折痕——平坦低模
+        # 的 Phong 插值场在每条基面边有 C0 折痕, h≠0 处会把线框浮雕进曲面
+        vn = np.empty(vcount * 3, np.float32)
+        tmp_me.vertex_normals.foreach_get("vector", vn)
+        n0_vert = vn.reshape(-1, 3)
+        n0_vert = n0_vert / np.maximum(np.linalg.norm(n0_vert, axis=1), 1e-12)[:, None]
         h_vert = core.average_loops_to_verts(h_loop, lv2, vcount)
-        n0_vert = core.average_loop_vectors_to_verts(n0_loop * w_loop[:, None], lv2, vcount)
-        ln = np.linalg.norm(n0_vert, axis=1)
-        n0_vert /= np.maximum(ln, 1e-6)[:, None]
-        amp_vert = h_vert * np.float32(s.disp_scale) * (ln > 0.1).astype(np.float32)
-        dvec = n0_vert * amp_vert[:, None]
+        dvec = n0_vert * (h_vert * np.float32(s.disp_scale))[:, None]
 
         # 边界硬锁: 开放边界顶点(卡片边缘)位移严格归零——边缘偏移会把原本
         # 贴合的卡片边撕出缝隙, 基面边缘本来就是对的; 平滑衰减带已在高度场

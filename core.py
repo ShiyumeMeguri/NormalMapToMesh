@@ -367,7 +367,7 @@ def integrate_height(gx, gy, smooth_sigma=0.0):
     Neumann 边界解。消除周期 FFT 的 wrap-around: 斜坡/非周期内容精确还原,
     岛间不再经图集边界环绕互相泄漏低频(旧高通压泄漏的拐杖随之废除)。
     梯度为 dh/du(物体单位/UV), 返回物理高度。4K 图瞬时内存 ~1.5GB(complex128)。
-    smooth_sigma: >0 时高斯低通(σ, UV单位), 用作顶点 Nyquist 抗混叠下限。
+    smooth_sigma: >0 时高斯低通(σ, UV单位)——级别匹配重建滤波 ⊕ 源噪声地板。
     """
     h, w = gx.shape
     gx2 = np.empty((2 * h, 2 * w), np.float32)
@@ -552,17 +552,6 @@ def average_loops_to_verts(loop_vals, loop_vert, vert_count):
     s = np.bincount(loop_vert, weights=loop_vals.astype(np.float64), minlength=vert_count)
     c = np.bincount(loop_vert, minlength=vert_count)
     return (s / np.maximum(c, 1)).astype(np.float32)
-
-
-def average_loop_vectors_to_verts(loop_vecs, loop_vert, vert_count):
-    """逐 loop 向量 → 逐顶点平均。(N,3) → (V,3)。"""
-    cnt = np.maximum(np.bincount(loop_vert, minlength=vert_count), 1)
-    out = np.empty((vert_count, 3), np.float32)
-    for c in range(3):
-        s = np.bincount(loop_vert, weights=loop_vecs[:, c].astype(np.float64),
-                        minlength=vert_count)
-        out[:, c] = (s / cnt).astype(np.float32)
-    return out
 
 
 # ---------------------------------------------------------------------------
@@ -787,10 +776,7 @@ def _selftest():
     lv = np.array([0, 1, 1], np.int32)
     avg = average_loops_to_verts(np.array([1.0, 2.0, 4.0], np.float32), lv, 2)
     assert np.allclose(avg, [1.0, 3.0])
-    vecs = np.array([[1, 0, 0], [0, 2, 0], [0, 4, 2]], np.float32)
-    avg3 = average_loop_vectors_to_verts(vecs, lv, 2)
-    assert np.allclose(avg3[1], [0, 3, 1])
-    print("[顶点平均] 标量/向量归并通过")
+    print("[顶点平均] 标量归并通过")
 
     print("core.py 自测全部通过 ✓")
 
