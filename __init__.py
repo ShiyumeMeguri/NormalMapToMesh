@@ -1,10 +1,10 @@
 # -*- coding: utf-8 -*-
 bl_info = {
     "name": "Normal Map To Mesh (法线→多级精度高模)",
-    "author": "Ruri",
+    "author": "ShiyumeMeguri",
     "version": (6, 2, 0),
     "blender": (4, 2, 0),
-    "location": "3D视图 > 侧栏(N) > Ruri",
+    "location": "3D视图 > 侧栏(N) > NormalMapToMesh",
     "description": "法线贴图 → Multires 高模(免烘焙直算): 位移 = 光滑场作用于光滑曲面。"
                    "基面 = 岛界折痕锁定的 Catmull-Clark 极限曲面(粗曲率交给细分, "
                    "边界折线精确锁原位), mikktspace 切线帧光栅化 + 镜像 Neumann 泊松"
